@@ -1,47 +1,48 @@
-> vite lint
-Found 0 warnings and 0 errors.
-Finished in <variable>ms on 1 file with <variable> rules using <variable> threads.
+> vp run test-task
+$ echo hello
+hello
 
-
-> vite run lint # lint script should have different cache from builtin lint
-$ echo lint script
-lint script
+$ node main.js
+foo
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     Vite+ Task Runner • Execution Summary
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Statistics:   1 tasks • 0 cache hits • 1 cache misses 
+Statistics:   2 tasks • 0 cache hits • 2 cache misses 
 Performance:  0% cache hit rate
 
 Task Details:
 ────────────────────────────────────────────────
-  [1] lint: $ echo lint script ✓
+  [1] test-task(subcommand 0): $ echo hello ✓
+      → Cache miss: no previous cache entry found
+  ·······················································
+  [2] test-task: $ node main.js ✓
       → Cache miss: no previous cache entry found
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-> echo 'console.log(1);' > a.js
-> vite lint
-✗ cache miss: content of input 'a.js' changed, executing
-Found 0 warnings and 0 errors.
-Finished in <variable>ms on 1 file with <variable> rules using <variable> threads.
+> tool replace-file-content main.js foo bar
+> vp run test-task
+$ echo hello (✓ cache hit, replaying)
+hello
 
-
-> vite run lint
-$ echo lint script (✓ cache hit, replaying)
-lint script
+$ node main.js (✗ cache miss: content of input 'main.js' changed, executing)
+bar
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     Vite+ Task Runner • Execution Summary
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Statistics:   1 tasks • 1 cache hits • 0 cache misses 
-Performance:  100% cache hit rate
+Statistics:   2 tasks • 1 cache hits • 1 cache misses 
+Performance:  50% cache hit rate
 
 Task Details:
 ────────────────────────────────────────────────
-  [1] lint: $ echo lint script ✓
+  [1] test-task(subcommand 0): $ echo hello ✓
       → Cache hit - output replayed - <variable>ms saved
+  ·······················································
+  [2] test-task: $ node main.js ✓
+      → Cache miss: content of input 'main.js' changed
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
