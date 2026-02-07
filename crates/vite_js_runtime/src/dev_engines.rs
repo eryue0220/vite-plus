@@ -1,80 +1,16 @@
-//! Package.json devEngines.runtime and engines.node parsing.
+//! `.node-version` file reading and writing utilities.
 //!
-//! This module provides structs for parsing the `devEngines.runtime` and `engines.node`
-//! fields from package.json. It also handles `.node-version` file reading and writing.
+//! This module provides utilities for working with `.node-version` files,
+//! which are used to specify Node.js versions for projects.
+//!
+//! For PackageJson types (devEngines, engines), see `vite_shared::package_json`.
 
-use serde::Deserialize;
 use vite_path::AbsolutePath;
+// Re-export shared types for internal use
+pub(crate) use vite_shared::PackageJson;
 use vite_str::Str;
 
 use crate::Error;
-
-/// A single runtime engine configuration.
-#[derive(Deserialize, Default, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeEngine {
-    /// The name of the runtime (e.g., "node", "deno", "bun")
-    #[serde(default)]
-    pub name: Str,
-    /// The version requirement (e.g., "^24.4.0")
-    #[serde(default)]
-    pub version: Str,
-    /// Action to take on failure (e.g., "download", "error", "warn")
-    /// Currently not used but parsed for future use.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub on_fail: Str,
-}
-
-/// Runtime field can be a single object or an array.
-#[derive(Deserialize, Debug)]
-#[serde(untagged)]
-pub enum RuntimeEngineConfig {
-    /// A single runtime configuration
-    Single(RuntimeEngine),
-    /// Multiple runtime configurations
-    Multiple(Vec<RuntimeEngine>),
-}
-
-impl RuntimeEngineConfig {
-    /// Find the first runtime with the given name.
-    #[must_use]
-    pub fn find_by_name(&self, name: &str) -> Option<&RuntimeEngine> {
-        match self {
-            Self::Single(engine) if engine.name == name => Some(engine),
-            Self::Single(_) => None,
-            Self::Multiple(engines) => engines.iter().find(|e| e.name == name),
-        }
-    }
-}
-
-/// The devEngines section of package.json.
-#[derive(Deserialize, Default, Debug)]
-pub struct DevEngines {
-    /// Runtime configuration(s)
-    #[serde(default)]
-    pub runtime: Option<RuntimeEngineConfig>,
-}
-
-/// The engines section of package.json.
-#[derive(Deserialize, Default, Debug)]
-pub struct Engines {
-    /// Node.js version requirement (e.g., ">=20.0.0")
-    #[serde(default)]
-    pub node: Option<Str>,
-}
-
-/// Partial package.json structure for reading devEngines and engines.
-#[derive(Deserialize, Default, Debug)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PackageJson {
-    /// The devEngines configuration
-    #[serde(default)]
-    pub dev_engines: Option<DevEngines>,
-    /// The engines configuration
-    #[serde(default)]
-    pub engines: Option<Engines>,
-}
 
 /// Parse the content of a `.node-version` file.
 ///
@@ -84,10 +20,12 @@ pub(crate) struct PackageJson {
 /// - With `v` prefix: `v20.5.0`
 /// - Two-part version: `20.5` (treated as `^20.5.0` for resolution)
 /// - Single-part version: `20` (treated as `^20.0.0` for resolution)
+/// - LTS aliases: `lts/*`, `lts/iron`, `lts/jod`, `lts/-1`
 ///
 /// # Returns
 ///
-/// The version string with any leading `v` prefix stripped.
+/// The version string with any leading `v` prefix stripped (for regular versions).
+/// LTS aliases are preserved as-is (e.g., `lts/iron` stays `lts/iron`).
 /// Returns `None` if the content is empty or contains only whitespace.
 #[must_use]
 pub fn parse_node_version_content(content: &str) -> Option<Str> {
@@ -95,7 +33,13 @@ pub fn parse_node_version_content(content: &str) -> Option<Str> {
     if version.is_empty() {
         return None;
     }
-    // Strip optional 'v' prefix
+
+    // Preserve LTS aliases as-is (lts/*, lts/iron, lts/-1, etc.)
+    if version.starts_with("lts/") {
+        return Some(version.into());
+    }
+
+    // Strip optional 'v' prefix for regular versions
     let version = version.strip_prefix('v').unwrap_or(version);
     Some(version.into())
 }
@@ -135,102 +79,10 @@ pub async fn write_node_version_file(
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+    use vite_path::AbsolutePathBuf;
+
     use super::*;
-
-    #[test]
-    fn test_parse_single_runtime() {
-        let json = r#"{
-            "devEngines": {
-                "runtime": {
-                    "name": "node",
-                    "version": "^24.4.0",
-                    "onFail": "download"
-                }
-            }
-        }"#;
-
-        let pkg: PackageJson = serde_json::from_str(json).unwrap();
-        let dev_engines = pkg.dev_engines.unwrap();
-        let runtime = dev_engines.runtime.unwrap();
-
-        let node = runtime.find_by_name("node").unwrap();
-        assert_eq!(node.name, "node");
-        assert_eq!(node.version, "^24.4.0");
-        assert_eq!(node.on_fail, "download");
-
-        assert!(runtime.find_by_name("deno").is_none());
-    }
-
-    #[test]
-    fn test_parse_multiple_runtimes() {
-        let json = r#"{
-            "devEngines": {
-                "runtime": [
-                    {
-                        "name": "node",
-                        "version": "^24.4.0",
-                        "onFail": "download"
-                    },
-                    {
-                        "name": "deno",
-                        "version": "^2.4.3",
-                        "onFail": "download"
-                    }
-                ]
-            }
-        }"#;
-
-        let pkg: PackageJson = serde_json::from_str(json).unwrap();
-        let dev_engines = pkg.dev_engines.unwrap();
-        let runtime = dev_engines.runtime.unwrap();
-
-        let node = runtime.find_by_name("node").unwrap();
-        assert_eq!(node.name, "node");
-        assert_eq!(node.version, "^24.4.0");
-
-        let deno = runtime.find_by_name("deno").unwrap();
-        assert_eq!(deno.name, "deno");
-        assert_eq!(deno.version, "^2.4.3");
-
-        assert!(runtime.find_by_name("bun").is_none());
-    }
-
-    #[test]
-    fn test_parse_no_dev_engines() {
-        let json = r#"{"name": "test"}"#;
-
-        let pkg: PackageJson = serde_json::from_str(json).unwrap();
-        assert!(pkg.dev_engines.is_none());
-    }
-
-    #[test]
-    fn test_parse_empty_dev_engines() {
-        let json = r#"{"devEngines": {}}"#;
-
-        let pkg: PackageJson = serde_json::from_str(json).unwrap();
-        let dev_engines = pkg.dev_engines.unwrap();
-        assert!(dev_engines.runtime.is_none());
-    }
-
-    #[test]
-    fn test_parse_runtime_with_missing_fields() {
-        let json = r#"{
-            "devEngines": {
-                "runtime": {
-                    "name": "node"
-                }
-            }
-        }"#;
-
-        let pkg: PackageJson = serde_json::from_str(json).unwrap();
-        let dev_engines = pkg.dev_engines.unwrap();
-        let runtime = dev_engines.runtime.unwrap();
-
-        let node = runtime.find_by_name("node").unwrap();
-        assert_eq!(node.name, "node");
-        assert!(node.version.is_empty());
-        assert!(node.on_fail.is_empty());
-    }
 
     #[test]
     fn test_parse_node_version_content_three_part() {
@@ -273,9 +125,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_node_version_file() {
-        use tempfile::TempDir;
-        use vite_path::AbsolutePathBuf;
-
         let temp_dir = TempDir::new().unwrap();
         let temp_path = AbsolutePathBuf::new(temp_dir.path().to_path_buf()).unwrap();
 
@@ -289,9 +138,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_node_version_file() {
-        use tempfile::TempDir;
-        use vite_path::AbsolutePathBuf;
-
         let temp_dir = TempDir::new().unwrap();
         let temp_path = AbsolutePathBuf::new(temp_dir.path().to_path_buf()).unwrap();
 
@@ -304,31 +150,33 @@ mod tests {
         assert_eq!(read_node_version_file(&temp_path).await, Some("22.13.1".into()));
     }
 
+    // ========================================================================
+    // LTS Alias Tests - These test support for lts/* syntax in .node-version
+    // ========================================================================
+
     #[test]
-    fn test_parse_engines_node() {
-        let json = r#"{"engines":{"node":">=20.0.0"}}"#;
-        let pkg: PackageJson = serde_json::from_str(json).unwrap();
-        assert_eq!(pkg.engines.unwrap().node, Some(">=20.0.0".into()));
+    fn test_parse_node_version_content_lts_latest() {
+        // lts/* should be preserved as-is (not stripped of prefix)
+        assert_eq!(parse_node_version_content("lts/*\n"), Some("lts/*".into()));
+        assert_eq!(parse_node_version_content("lts/*"), Some("lts/*".into()));
+        assert_eq!(parse_node_version_content("  lts/*  \n"), Some("lts/*".into()));
     }
 
     #[test]
-    fn test_parse_engines_node_empty() {
-        let json = r#"{"engines":{}}"#;
-        let pkg: PackageJson = serde_json::from_str(json).unwrap();
-        assert!(pkg.engines.unwrap().node.is_none());
+    fn test_parse_node_version_content_lts_codename() {
+        // lts/<codename> should be preserved as-is
+        assert_eq!(parse_node_version_content("lts/iron\n"), Some("lts/iron".into()));
+        assert_eq!(parse_node_version_content("lts/jod\n"), Some("lts/jod".into()));
+        assert_eq!(parse_node_version_content("lts/hydrogen\n"), Some("lts/hydrogen".into()));
+        // Should preserve original case for codenames
+        assert_eq!(parse_node_version_content("lts/Iron\n"), Some("lts/Iron".into()));
+        assert_eq!(parse_node_version_content("lts/Jod\n"), Some("lts/Jod".into()));
     }
 
     #[test]
-    fn test_parse_both_engines_and_dev_engines() {
-        let json = r#"{
-            "engines": {"node": ">=20.0.0"},
-            "devEngines": {"runtime": {"name": "node", "version": "^24.4.0"}}
-        }"#;
-        let pkg: PackageJson = serde_json::from_str(json).unwrap();
-        assert_eq!(pkg.engines.unwrap().node, Some(">=20.0.0".into()));
-        let dev_engines = pkg.dev_engines.unwrap();
-        let runtime = dev_engines.runtime.unwrap();
-        let node = runtime.find_by_name("node").unwrap();
-        assert_eq!(node.version, "^24.4.0");
+    fn test_parse_node_version_content_lts_offset() {
+        // lts/-n should be preserved as-is
+        assert_eq!(parse_node_version_content("lts/-1\n"), Some("lts/-1".into()));
+        assert_eq!(parse_node_version_content("lts/-2\n"), Some("lts/-2".into()));
     }
 }

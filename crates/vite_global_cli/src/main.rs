@@ -11,28 +11,36 @@ mod cli;
 mod commands;
 mod error;
 mod js_executor;
+mod shim;
 
 use std::process::ExitCode;
 
-use vite_path::AbsolutePathBuf;
-
 use crate::cli::{parse_args_from, run_command};
 
-/// Normalize help arguments: transform `help [command]` into `[command] --help`
-fn normalize_help_args() -> Vec<String> {
-    let args: Vec<String> = std::env::args().collect();
-
-    // Skip the binary name (args[0])
+/// Normalize CLI arguments:
+/// - `vp list ...` / `vp ls ...` → `vp pm list ...`
+/// - `vp help [command]` → `vp [command] --help`
+fn normalize_args(args: Vec<String>) -> Vec<String> {
     match args.get(1).map(String::as_str) {
+        // `vp list ...` → `vp pm list ...`
+        // `vp ls ...` → `vp pm list ...`
+        Some("list" | "ls") => {
+            let mut normalized = Vec::with_capacity(args.len() + 1);
+            normalized.push(args[0].clone());
+            normalized.push("pm".to_string());
+            normalized.push("list".to_string());
+            normalized.extend(args[2..].iter().cloned());
+            normalized
+        }
         // `vp help` alone -> show main help
         Some("help") if args.len() == 2 => vec![args[0].clone(), "--help".to_string()],
         // `vp help [command] [args...]` -> `vp [command] --help [args...]`
         Some("help") if args.len() > 2 => {
             let mut normalized = Vec::with_capacity(args.len());
-            normalized.push(args[0].clone()); // binary name
-            normalized.push(args[2].clone()); // command
+            normalized.push(args[0].clone());
+            normalized.push(args[2].clone());
             normalized.push("--help".to_string());
-            normalized.extend(args[3..].iter().cloned()); // remaining args
+            normalized.extend(args[3..].iter().cloned());
             normalized
         }
         // No transformation needed
@@ -40,39 +48,38 @@ fn normalize_help_args() -> Vec<String> {
     }
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     // Initialize tracing
     vite_shared::init_tracing();
 
-    // Get current working directory
-    let cwd = match std::env::current_dir() {
-        Ok(path) => {
-            if let Some(abs_path) = AbsolutePathBuf::new(path) {
-                abs_path
-            } else {
-                eprintln!("Error: Invalid current directory path");
-                return ExitCode::FAILURE;
-            }
-        }
+    // Check for shim mode (invoked as node, npm, or npx)
+    let args: Vec<String> = std::env::args().collect();
+    let argv0 = args.first().map(|s| s.as_str()).unwrap_or("vp");
+    tracing::debug!("argv0: {argv0}");
+
+    if let Some(tool) = shim::detect_shim_tool(argv0) {
+        // Shim mode - dispatch to the appropriate tool
+        let exit_code = shim::dispatch(&tool, &args[1..]).await;
+        return ExitCode::from(exit_code as u8);
+    }
+
+    // Normal CLI mode - get current working directory
+    let cwd = match vite_path::current_dir() {
+        Ok(path) => path,
         Err(e) => {
             eprintln!("Error: Failed to get current directory: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    // Normalize help arguments: transform `help [command]` into `[command] --help`
-    let normalized_args = normalize_help_args();
+    // Normalize arguments (list/ls aliases, help rewriting)
+    let normalized_args = normalize_args(args);
 
     // Parse CLI arguments (using custom help formatting)
     let args = parse_args_from(normalized_args);
 
-    // Run the async runtime
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create Tokio runtime");
-
-    match runtime.block_on(run_command(cwd, args)) {
+    match run_command(cwd, args).await {
         Ok(exit_status) => {
             if exit_status.success() {
                 ExitCode::SUCCESS

@@ -44,9 +44,31 @@ pub async fn execute_pm_subcommand(
     cwd: AbsolutePathBuf,
     command: PmCommands,
 ) -> Result<ExitStatus, Error> {
+    // Intercept `pm list -g` to use vite-plus managed global packages listing
+    if let PmCommands::List { global: true, json, ref pattern, .. } = command {
+        return crate::commands::env::packages::execute(json, pattern.as_deref()).await;
+    }
+
     prepend_js_runtime_to_path_env(&cwd).await?;
 
-    let package_manager = PackageManager::builder(&cwd).build_with_default().await?;
+    let package_manager = match PackageManager::builder(&cwd).build_with_default().await {
+        Ok(pm) => pm,
+        Err(e) => {
+            // For `list` command, silently succeed when no workspace is found
+            // (matches `pnpm list` behavior in dirs without package.json)
+            if matches!(&command, PmCommands::List { .. })
+                && matches!(
+                    &e,
+                    vite_error::Error::WorkspaceError(vite_workspace::Error::PackageJsonNotFound(
+                        _
+                    ))
+                )
+            {
+                return Ok(ExitStatus::default());
+            }
+            return Err(e.into());
+        }
+    };
 
     match command {
         PmCommands::Prune { prod, no_optional, pass_through_args } => {

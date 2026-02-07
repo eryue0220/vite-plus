@@ -34,6 +34,17 @@ pub enum Error {
     #[error("Install error: {0}")]
     Install(#[from] vite_error::Error),
 
+    #[error("Configuration error: {0}")]
+    ConfigError(Str),
+
+    #[error("JSON error: {0}")]
+    JsonError(#[from] serde_json::Error),
+
     #[error("{0}")]
     Other(Str),
+
+    #[error(
+        "Executable '{bin_name}' is already installed by {existing_package}\n\nPlease remove {existing_package} before installing {new_package}, or use --force to auto-replace"
+    )]
+    BinaryConflict { bin_name: String, existing_package: String, new_package: String },
 }

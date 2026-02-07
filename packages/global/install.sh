@@ -7,22 +7,35 @@
 #
 # Environment variables:
 #   VITE_PLUS_VERSION - Version to install (default: latest)
-#   VITE_PLUS_INSTALL_DIR - Installation directory (default: ~/.vite-plus)
+#   VITE_PLUS_HOME - Installation directory (default: ~/.vite-plus)
 #   NPM_CONFIG_REGISTRY - Custom npm registry URL (default: https://registry.npmjs.org)
+#   VITE_PLUS_LOCAL_TGZ - Path to local vite-plus-cli.tgz (for development/testing)
 
 set -e
 
 VITE_PLUS_VERSION="${VITE_PLUS_VERSION:-latest}"
-INSTALL_DIR="${VITE_PLUS_INSTALL_DIR:-$HOME/.vite-plus}"
+INSTALL_DIR="${VITE_PLUS_HOME:-$HOME/.vite-plus}"
+# Use $HOME-relative path for shell config references (portable across sessions)
+if case "$INSTALL_DIR" in "$HOME"/*) true;; *) false;; esac; then
+  INSTALL_DIR_REF="\$HOME${INSTALL_DIR#"$HOME"}"
+else
+  INSTALL_DIR_REF="$INSTALL_DIR"
+fi
 # npm registry URL (strip trailing slash if present)
 NPM_REGISTRY="${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org}"
 NPM_REGISTRY="${NPM_REGISTRY%/}"
+# Local tarball for development/testing
+LOCAL_TGZ="${VITE_PLUS_LOCAL_TGZ:-}"
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
+BRIGHT_BLUE='\033[0;94m'
+BOLD='\033[1m'
+DIM='\033[2m'
+BOLD_BRIGHT_BLUE='\033[1;94m'
 NC='\033[0m' # No Color
 
 info() {
@@ -296,24 +309,157 @@ download_and_extract() {
   rm -f "$temp_file"
 }
 
-# Add to shell profile
+# Add bin to shell profile by sourcing the env file
 # Returns: 0 = path added, 1 = file not found, 2 = path already exists
-add_to_path() {
+add_bin_to_path() {
   local shell_config="$1"
-  local path_to_add="$INSTALL_DIR/current/bin"
-  local path_line="export PATH=\"$path_to_add:\$PATH\""
+  local env_file="$INSTALL_DIR_REF/env"
+  # Escape both absolute and $HOME-relative forms for grep (backward compat)
+  local abs_pattern ref_pattern
+  abs_pattern=$(printf '%s' "$INSTALL_DIR" | sed 's/[.[\*^$()+?{|]/\\&/g')
+  ref_pattern=$(printf '%s' "$INSTALL_DIR_REF" | sed 's/[.[\*^$()+?{|]/\\&/g')
 
   if [ -f "$shell_config" ]; then
-    # Check if already has the current/bin path
-    if grep -q "$path_to_add" "$shell_config" 2>/dev/null; then
+    if grep -q "${abs_pattern}/env" "$shell_config" 2>/dev/null || \
+       grep -q "${ref_pattern}/env" "$shell_config" 2>/dev/null; then
       return 2
     fi
     echo "" >> "$shell_config"
-    echo "# Added by vite-plus installer" >> "$shell_config"
-    echo "$path_line" >> "$shell_config"
+    echo "# Vite+ bin (https://viteplus.dev)" >> "$shell_config"
+    echo ". \"$env_file\"" >> "$shell_config"
     return 0
   fi
   return 1
+}
+
+# Configure shell PATH for ~/.vite-plus/bin
+# Sets PATH_CONFIGURED and SHELL_CONFIG_UPDATED globals
+configure_shell_path() {
+  local bin_path="$INSTALL_DIR/bin"
+  PATH_CONFIGURED="false"
+  SHELL_CONFIG_UPDATED=""
+
+  local result=1  # Default to failure - must explicitly set success
+  case "$SHELL" in
+    */zsh)
+      # Add to both .zshenv (for all shells including IDE) and .zshrc (to ensure PATH is at front)
+      # Create .zshenv if missing — it's the canonical place for PATH in zsh
+      # and is sourced by all session types (interactive, non-interactive, IDE)
+      [ -f "$HOME/.zshenv" ] || touch "$HOME/.zshenv"
+      local zshenv_result=0 zshrc_result=0
+      add_bin_to_path "$HOME/.zshenv" || zshenv_result=$?
+      add_bin_to_path "$HOME/.zshrc" || zshrc_result=$?
+      # Prioritize .zshrc for user notification (easier to source)
+      if [ $zshrc_result -eq 0 ]; then
+        result=0
+        SHELL_CONFIG_UPDATED=".zshrc"
+      elif [ $zshenv_result -eq 0 ]; then
+        result=0
+        SHELL_CONFIG_UPDATED=".zshenv"
+      elif [ $zshenv_result -eq 2 ] || [ $zshrc_result -eq 2 ]; then
+        result=2  # already configured in at least one file
+      fi
+      ;;
+    */bash)
+      # Add to .bash_profile, .bashrc, AND .profile for maximum compatibility
+      # - .bash_profile: login shells (macOS default)
+      # - .bashrc: interactive non-login shells (Linux default)
+      # - .profile: fallback for systems without .bash_profile (Ubuntu minimal, etc.)
+      local bash_profile_result=0 bashrc_result=0 profile_result=0
+      add_bin_to_path "$HOME/.bash_profile" || bash_profile_result=$?
+      add_bin_to_path "$HOME/.bashrc" || bashrc_result=$?
+      add_bin_to_path "$HOME/.profile" || profile_result=$?
+      # Prioritize .bashrc for user notification (most commonly edited)
+      if [ $bashrc_result -eq 0 ]; then
+        result=0
+        SHELL_CONFIG_UPDATED=".bashrc"
+      elif [ $bash_profile_result -eq 0 ]; then
+        result=0
+        SHELL_CONFIG_UPDATED=".bash_profile"
+      elif [ $profile_result -eq 0 ]; then
+        result=0
+        SHELL_CONFIG_UPDATED=".profile"
+      elif [ $bash_profile_result -eq 2 ] || [ $bashrc_result -eq 2 ] || [ $profile_result -eq 2 ]; then
+        result=2  # already configured in at least one file
+      fi
+      ;;
+    */fish)
+      local fish_config="$HOME/.config/fish/config.fish"
+      # Escape both absolute and $HOME-relative forms for grep (backward compat)
+      local fish_abs_pattern fish_ref_pattern
+      fish_abs_pattern=$(printf '%s' "$INSTALL_DIR" | sed 's/[.[\*^$()+?{|]/\\&/g')
+      fish_ref_pattern=$(printf '%s' "$INSTALL_DIR_REF" | sed 's/[.[\*^$()+?{|]/\\&/g')
+      if [ -f "$fish_config" ]; then
+        if grep -q "${fish_abs_pattern}/env" "$fish_config" 2>/dev/null || \
+           grep -q "${fish_ref_pattern}/env" "$fish_config" 2>/dev/null; then
+          result=2
+        else
+          echo "" >> "$fish_config"
+          echo "# Vite+ bin (https://viteplus.dev)" >> "$fish_config"
+          echo "source \"$INSTALL_DIR_REF/env.fish\"" >> "$fish_config"
+          result=0
+          SHELL_CONFIG_UPDATED="config.fish"
+        fi
+      fi
+      ;;
+  esac
+
+  if [ $result -eq 0 ]; then
+    PATH_CONFIGURED="true"
+  elif [ $result -eq 2 ]; then
+    PATH_CONFIGURED="already"
+  fi
+  # If result is still 1, PATH_CONFIGURED remains "false" (set at function start)
+}
+
+# Setup Node.js version manager (node/npm/npx shims)
+# Sets NODE_MANAGER_ENABLED global
+# Arguments: bin_dir - path to the version's bin directory containing vp
+setup_node_manager() {
+  local bin_dir="$1"
+  local bin_path="$INSTALL_DIR/bin"
+  NODE_MANAGER_ENABLED="false"
+
+  # Check if Vite+ is already managing Node.js (bin/node exists)
+  if [ -e "$bin_path/node" ]; then
+    # Already managing Node.js, just refresh shims
+    "$bin_dir/vp" env setup --refresh > /dev/null
+    NODE_MANAGER_ENABLED="already"
+    return 0
+  fi
+
+  # Auto-enable on CI environment
+  if [ -n "$CI" ]; then
+    "$bin_dir/vp" env setup --refresh > /dev/null
+    NODE_MANAGER_ENABLED="true"
+    return 0
+  fi
+
+  # Check if node is available on the system
+  local node_available="false"
+  if command -v node &> /dev/null; then
+    node_available="true"
+  fi
+
+  # Auto-enable if no node available on system
+  if [ "$node_available" = "false" ]; then
+    "$bin_dir/vp" env setup --refresh > /dev/null
+    NODE_MANAGER_ENABLED="true"
+    return 0
+  fi
+
+  # Prompt user in interactive mode
+  if [ -e /dev/tty ] && [ -t 1 ]; then
+    echo ""
+    echo "Would you want Vite+ to manage Node.js versions?"
+    echo -n "Press Enter to accept (Y/n): "
+    read -r response < /dev/tty
+
+    if [ -z "$response" ] || [ "$response" = "y" ] || [ "$response" = "Y" ]; then
+      "$bin_dir/vp" env setup --refresh > /dev/null
+      NODE_MANAGER_ENABLED="true"
+    fi
+  fi
 }
 
 # Cleanup old versions, keeping only the most recent ones
@@ -321,11 +467,13 @@ cleanup_old_versions() {
   local max_versions=5
   local versions=()
 
-  # List version directories (exclude 'current' symlink)
+  # List version directories (semver format like 0.1.0, 1.2.3-beta.1, 0.0.0-f48af939.20260205-0533)
+  # This excludes 'current' symlink and non-semver directories like 'local-dev'
+  local semver_regex='^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?$'
   for dir in "$INSTALL_DIR"/*/; do
     local name
     name=$(basename "$dir")
-    if [ "$name" != "current" ] && [ -d "$dir" ]; then
+    if [ -d "$dir" ] && [[ "$name" =~ $semver_regex ]]; then
       versions+=("$dir")
     fi
   done
@@ -360,84 +508,30 @@ cleanup_old_versions() {
   done
 }
 
-# Setup PATH - try ~/.local/bin symlink first, fallback to shell profile
-# Returns via global variables:
-#   SYMLINK_CREATED - "true" if symlink was created, "false" otherwise
-#   SHELL_CONFIG_UPDATED - shell config file name if updated, empty otherwise
-#   PATH_ALREADY_CONFIGURED - "true" if PATH was already set up
-setup_path() {
-  local local_bin="$HOME/.local/bin"
-  local path_to_add="$INSTALL_DIR/current/bin"
-
-  SYMLINK_CREATED="false"
-  SHELL_CONFIG_UPDATED=""
-  PATH_ALREADY_CONFIGURED="false"
-
-  # Check if ~/.local/bin is in PATH
-  if echo "$PATH" | tr ':' '\n' | grep -qx "$local_bin"; then
-    # Create ~/.local/bin if it doesn't exist
-    mkdir -p "$local_bin"
-    # Create symlink (force overwrite if exists)
-    ln -sf "$INSTALL_DIR/current/bin/vp" "$local_bin/vp"
-    SYMLINK_CREATED="true"
-    return 0
-  fi
-
-  # Fall back to adding to shell profile
-  local path_result=1  # 0=added, 1=failed, 2=already exists
-
-  case "$SHELL" in
-    */zsh)
-      add_to_path "$HOME/.zshrc"
-      path_result=$?
-      [ $path_result -ne 1 ] && SHELL_CONFIG_UPDATED=".zshrc"
-      ;;
-    */bash)
-      add_to_path "$HOME/.bashrc"
-      path_result=$?
-      if [ $path_result -ne 1 ]; then
-        SHELL_CONFIG_UPDATED=".bashrc"
-      else
-        add_to_path "$HOME/.bash_profile"
-        path_result=$?
-        [ $path_result -ne 1 ] && SHELL_CONFIG_UPDATED=".bash_profile"
-      fi
-      ;;
-    */fish)
-      local fish_config="$HOME/.config/fish/config.fish"
-      if [ -f "$fish_config" ]; then
-        if grep -q "$path_to_add" "$fish_config" 2>/dev/null; then
-          path_result=2
-          SHELL_CONFIG_UPDATED="config.fish"
-        else
-          echo "" >> "$fish_config"
-          echo "# Added by vite-plus installer" >> "$fish_config"
-          echo "set -gx PATH $path_to_add \$PATH" >> "$fish_config"
-          path_result=0
-          SHELL_CONFIG_UPDATED="config.fish"
-        fi
-      fi
-      ;;
-  esac
-
-  if [ $path_result -eq 2 ]; then
-    PATH_ALREADY_CONFIGURED="true"
-  fi
-}
-
 main() {
   echo ""
-  echo "Setting up VITE+(⚡︎)..."
-  echo ""
+  echo -e "Setting up VITE+(⚡︎)..."
 
   check_requirements
 
   local platform
   platform=$(detect_platform)
 
-  # Fetch package metadata and resolve version
-  get_version_from_metadata
-  VITE_PLUS_VERSION="$RESOLVED_VERSION"
+  # Local development mode: use local tgz
+  if [ -n "$LOCAL_TGZ" ]; then
+    # Validate local tgz
+    if [ ! -f "$LOCAL_TGZ" ]; then
+      error "Local tarball not found: $LOCAL_TGZ"
+    fi
+    # Use version as-is (default to "local-dev")
+    if [ "$VITE_PLUS_VERSION" = "latest" ] || [ "$VITE_PLUS_VERSION" = "test" ]; then
+      VITE_PLUS_VERSION="local-dev"
+    fi
+  else
+    # Fetch package metadata and resolve version from npm
+    get_version_from_metadata
+    VITE_PLUS_VERSION="$RESOLVED_VERSION"
+  fi
 
   # Set up version-specific directories
   VERSION_DIR="$INSTALL_DIR/$VITE_PLUS_VERSION"
@@ -445,10 +539,6 @@ main() {
   DIST_DIR="$VERSION_DIR/dist"
   CURRENT_LINK="$INSTALL_DIR/current"
 
-  # Get package suffix from optionalDependencies (dynamic lookup)
-  get_package_suffix "$platform"
-
-  local package_name="@voidzero-dev/vite-plus-cli-${PACKAGE_SUFFIX}"
   local binary_name="vp"
   if [[ "$platform" == win32* ]]; then
     binary_name="vp.exe"
@@ -458,40 +548,76 @@ main() {
   mkdir -p "$BIN_DIR" "$DIST_DIR"
 
   # Download and extract native binary and .node files from platform package
-  local platform_url="${NPM_REGISTRY}/${package_name}/-/vite-plus-cli-${PACKAGE_SUFFIX}-${VITE_PLUS_VERSION}.tgz"
-
-  # Create temp directory for extraction
-  local platform_temp_dir
-  platform_temp_dir=$(mktemp -d)
-  download_and_extract "$platform_url" "$platform_temp_dir" 1
-
-  # Copy binary to BIN_DIR
-  cp "$platform_temp_dir/$binary_name" "$BIN_DIR/"
-  chmod +x "$BIN_DIR/$binary_name"
-
-  # Copy .node files to DIST_DIR (delete existing first to avoid system cache issues)
-  for node_file in "$platform_temp_dir"/*.node; do
-    rm -f "$DIST_DIR/$(basename "$node_file")"
-    cp "$node_file" "$DIST_DIR/"
-  done
-  rm -rf "$platform_temp_dir"
-
-  # Download and extract JS bundle from main package
-  local main_url="${NPM_REGISTRY}/vite-plus-cli/-/vite-plus-cli-${VITE_PLUS_VERSION}.tgz"
-
-  # Create temp directory for extraction
-  local temp_dir
-  temp_dir=$(mktemp -d)
-  download_and_extract "$main_url" "$temp_dir" 1
-
-  # Copy directories and files to VERSION_DIR
+  # Also copy JS bundle and assets
   local items_to_copy=("dist" "templates" "rules" "AGENTS.md" "package.json")
-  for item in "${items_to_copy[@]}"; do
-    if [ -e "$temp_dir/$item" ]; then
-      cp -r "$temp_dir/$item" "$VERSION_DIR/"
-    fi
-  done
-  rm -rf "$temp_dir"
+
+  if [ -n "$LOCAL_TGZ" ]; then
+    # Use local tarball for development/testing
+    info "Using local tarball: $LOCAL_TGZ"
+
+    # Extract everything from tgz
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    tar xzf "$LOCAL_TGZ" -C "$temp_dir" --strip-components=1
+
+    # Copy binary
+    cp "$temp_dir/bin/$binary_name" "$BIN_DIR/"
+    chmod +x "$BIN_DIR/$binary_name"
+
+    # Copy .node files if present
+    for node_file in "$temp_dir"/dist/*.node; do
+      if [ -f "$node_file" ]; then
+        rm -f "$DIST_DIR/$(basename "$node_file")"
+        cp "$node_file" "$DIST_DIR/"
+      fi
+    done
+
+    # Copy JS assets
+    for item in "${items_to_copy[@]}"; do
+      if [ -e "$temp_dir/$item" ]; then
+        cp -r "$temp_dir/$item" "$VERSION_DIR/"
+      fi
+    done
+
+    rm -rf "$temp_dir"
+  else
+    # Download from npm registry
+    # Get package suffix from optionalDependencies (dynamic lookup)
+    get_package_suffix "$platform"
+    local package_name="@voidzero-dev/vite-plus-cli-${PACKAGE_SUFFIX}"
+    local platform_url="${NPM_REGISTRY}/${package_name}/-/vite-plus-cli-${PACKAGE_SUFFIX}-${VITE_PLUS_VERSION}.tgz"
+
+    # Create temp directory for extraction
+    local platform_temp_dir
+    platform_temp_dir=$(mktemp -d)
+    download_and_extract "$platform_url" "$platform_temp_dir" 1
+
+    # Copy binary to BIN_DIR
+    cp "$platform_temp_dir/$binary_name" "$BIN_DIR/"
+    chmod +x "$BIN_DIR/$binary_name"
+
+    # Copy .node files to DIST_DIR (delete existing first to avoid system cache issues)
+    for node_file in "$platform_temp_dir"/*.node; do
+      rm -f "$DIST_DIR/$(basename "$node_file")"
+      cp "$node_file" "$DIST_DIR/"
+    done
+    rm -rf "$platform_temp_dir"
+
+    # Download and extract JS bundle and assets from npm
+    local main_url="${NPM_REGISTRY}/vite-plus-cli/-/vite-plus-cli-${VITE_PLUS_VERSION}.tgz"
+
+    # Create temp directory for extraction
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    download_and_extract "$main_url" "$temp_dir" 1
+
+    for item in "${items_to_copy[@]}"; do
+      if [ -e "$temp_dir/$item" ]; then
+        cp -r "$temp_dir/$item" "$VERSION_DIR/"
+      fi
+    done
+    rm -rf "$temp_dir"
+  fi
 
   # Remove devDependencies and optionalDependencies from package.json
   # (temporary solution until deps are fully bundled)
@@ -520,36 +646,66 @@ main() {
   # Create/update current symlink (use relative path for portability)
   ln -sfn "$VITE_PLUS_VERSION" "$CURRENT_LINK"
 
+  # Create bin directory and vp symlink (always done)
+  mkdir -p "$INSTALL_DIR/bin"
+  ln -sf "../current/bin/vp" "$INSTALL_DIR/bin/vp"
+
   # Cleanup old versions
   cleanup_old_versions
 
-  # Setup PATH (sets SYMLINK_CREATED, SHELL_CONFIG_UPDATED, PATH_ALREADY_CONFIGURED)
-  setup_path
+  # Create env files with PATH guard (prevents duplicate PATH entries)
+  "$INSTALL_DIR/bin/vp" env setup --env-only > /dev/null
 
-  # Determine display location based on how PATH was configured
-  local display_location
-  if [ "$SYMLINK_CREATED" = "true" ]; then
-    display_location="~/.local/bin/vp"
-  else
-    # Use ~ shorthand if install dir is under HOME, otherwise show full path
-    local display_dir="${INSTALL_DIR/#$HOME/~}"
-    display_location="${display_dir}/current/bin"
-  fi
+  # Configure shell PATH (always attempted)
+  configure_shell_path
+
+  # Setup Node.js version manager (shims) - separate component
+  setup_node_manager "$BIN_DIR"
+
+  # Use ~ shorthand if install dir is under HOME, otherwise show full path
+  local display_dir="${INSTALL_DIR/#$HOME/~}"
+  local display_location="${display_dir}/bin"
 
   # Print success message
   echo ""
-  echo -e "${GREEN}✔${NC} VITE+(⚡︎) successfully installed!"
+  echo -e "${GREEN}✔${NC} ${BOLD_BRIGHT_BLUE}VITE+(⚡︎)${NC} successfully installed!"
   echo ""
-  echo "  Version: ${VITE_PLUS_VERSION}"
+  echo "  The Unified Toolchain for the Web."
   echo ""
-  echo "  Location: ${display_location}"
-  echo ""
-  echo "  Next: Run vp --help to get started"
+  echo -e "  ${BOLD}Get started:${NC}"
+  echo -e "    ${BRIGHT_BLUE}vp new${NC}          Create a new project"
+  echo -e "    ${BRIGHT_BLUE}vp env${NC}          Manage Node.js versions"
+  echo -e "    ${BRIGHT_BLUE}vp install${NC}      Install dependencies"
+  echo -e "    ${BRIGHT_BLUE}vp dev${NC}          Start dev server"
 
-  # Show note if shell config was updated (not symlink, not already configured)
-  if [ "$SYMLINK_CREATED" = "false" ] && [ -n "$SHELL_CONFIG_UPDATED" ] && [ "$PATH_ALREADY_CONFIGURED" = "false" ]; then
+  if [ "$NODE_MANAGER_ENABLED" = "true" ] || [ "$NODE_MANAGER_ENABLED" = "already" ]; then
+    echo ""
+    echo -e "  Node.js is now managed by Vite+ (via ${BRIGHT_BLUE}vp env${NC})."
+    echo -e "  Run ${BRIGHT_BLUE}vp env doctor${NC} to verify your setup."
+  fi
+
+  echo ""
+  echo -e "  Run ${BRIGHT_BLUE}vp help${NC} for more information."
+
+  # Show restart note if PATH was added to shell config
+  if [ "$PATH_CONFIGURED" = "true" ] && [ -n "$SHELL_CONFIG_UPDATED" ]; then
     echo ""
     echo "  Note: Run \`source ~/$SHELL_CONFIG_UPDATED\` or restart your terminal."
+  fi
+
+  # Show warning if PATH could not be automatically configured
+  if [ "$PATH_CONFIGURED" = "false" ]; then
+    echo ""
+    echo -e "  ${YELLOW}note${NC}: Could not automatically add vp to your PATH."
+    echo ""
+    echo "  To use vp, add this line to your shell config file:"
+    echo ""
+    echo "    . \"$INSTALL_DIR_REF/env\""
+    echo ""
+    echo "  Common config files:"
+    echo "    - Bash: ~/.bashrc or ~/.bash_profile"
+    echo "    - Zsh:  ~/.zshrc"
+    echo "    - Fish: source \"$INSTALL_DIR_REF/env.fish\" in ~/.config/fish/config.fish"
   fi
 
   echo ""

@@ -133,7 +133,9 @@ jobs:
           target: x86_64-unknown-linux-gnu
 
       - name: Build CLI
-        run: pnpm bootstrap-cli:ci
+        run: |
+          pnpm bootstrap-cli:ci
+          echo "$HOME/.vite-plus-dev/bin" >> $GITHUB_PATH
 
       - name: Print help for built-in commands
         run: |
@@ -195,6 +197,14 @@ jobs:
       - name: Build CLI
         run: |
           pnpm bootstrap-cli:ci
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            echo "$USERPROFILE\.vite-plus-dev\bin" >> $GITHUB_PATH
+          else
+            echo "$HOME/.vite-plus-dev/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Verify CLI installation
+        run: |
           which vp
           vp --version
           vp -h
@@ -211,6 +221,137 @@ jobs:
 
       - name: Run CLI lint
         run: vp run lint
+
+      - name: Test global package install (powershell)
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          echo "PATH: $env:Path"
+          where.exe node
+          where.exe npm
+          where.exe npx
+          where.exe vp
+          vp env doctor
+
+          # Test 1: Install a JS-based CLI (typescript)
+          vp install -g typescript
+          tsc --version
+          where.exe tsc
+
+          # Test 2: Verify the package was installed correctly
+          Get-ChildItem "$env:USERPROFILE\.vite-plus-dev\packages\typescript\"
+          Get-ChildItem "$env:USERPROFILE\.vite-plus-dev\bin\"
+
+          # Test 3: Uninstall
+          vp uninstall -g typescript
+
+          # Test 4: Verify uninstall removed shim
+          Write-Host "Checking bin dir after uninstall:"
+          Get-ChildItem "$env:USERPROFILE\.vite-plus-dev\bin\"
+          $shimPath = "$env:USERPROFILE\.vite-plus-dev\bin\tsc.cmd"
+          if (Test-Path $shimPath) {
+            Write-Error "tsc shim file still exists at $shimPath"
+            exit 1
+          }
+          Write-Host "tsc shim removed successfully"
+
+          # Test 5: use session
+          vp env use 18
+          node --version
+          vp env doctor
+          vp env use --unset
+          node --version
+
+      - name: Test global package install (cmd)
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: cmd
+        run: |
+          echo "PATH: %PATH%"
+          where.exe node
+          where.exe npm
+          where.exe npx
+          where.exe vp
+
+          vp env use 18
+          node --version
+          vp env use --unset
+          node --version
+
+          vp env doctor
+
+          REM Test 1: Install a JS-based CLI (typescript)
+          vp install -g typescript
+          tsc --version
+          where.exe tsc
+
+          REM Test 2: Verify the package was installed correctly
+          dir "%USERPROFILE%\.vite-plus-dev\packages\typescript\"
+          dir "%USERPROFILE%\.vite-plus-dev\bin\"
+
+          REM Test 3: Uninstall
+          vp uninstall -g typescript
+
+          REM Test 4: Verify uninstall removed shim (.cmd wrapper)
+          echo Checking bin dir after uninstall:
+          dir "%USERPROFILE%\.vite-plus-dev\bin\"
+          if exist "%USERPROFILE%\.vite-plus-dev\bin\tsc.cmd" (
+            echo Error: tsc.cmd shim file still exists
+            exit /b 1
+          )
+          echo tsc.cmd shim removed successfully
+
+          REM Test 5: Verify shell script was also removed (for Git Bash)
+          if exist "%USERPROFILE%\.vite-plus-dev\bin\tsc" (
+            echo Error: tsc shell script still exists
+            exit /b 1
+          )
+          echo tsc shell script removed successfully
+
+          REM Test 6: use session
+          vp env use 18
+          node --version
+          vp env doctor
+          vp env use --unset
+          node --version
+
+      - name: Test global package install (bash)
+        run: |
+          echo "PATH: $PATH"
+          ls -la ~/.vite-plus-dev/
+          ls -la ~/.vite-plus-dev/bin/
+          which node
+          which npm
+          which npx
+          which vp
+          vp env doctor
+
+          # Test 1: Install a JS-based CLI (typescript)
+          vp install -g typescript
+          tsc --version
+          which tsc
+
+          # Test 2: Verify the package was installed correctly
+          ls -la ~/.vite-plus-dev/packages/typescript/
+          ls -la ~/.vite-plus-dev/bin/
+
+          # Test 3: Uninstall
+          vp uninstall -g typescript
+
+          # Test 4: Verify uninstall removed shim
+          echo "Checking bin dir after uninstall:"
+          ls -la ~/.vite-plus-dev/bin/
+          if [ -f ~/.vite-plus-dev/bin/tsc ]; then
+            echo "Error: tsc shim file still exists at ~/.vite-plus-dev/bin/tsc"
+            exit 1
+          fi
+          echo "tsc shim removed successfully"
+
+          # Test 5: use session
+          vp env use 18
+          node --version
+          vp env doctor
+          vp env use --unset
+          node --version
 
       - name: Install Playwright browsers
         run: pnpx playwright install chromium
@@ -255,7 +396,9 @@ jobs:
           target: x86_64-unknown-linux-gnu
 
       - name: Build CLI
-        run: pnpm bootstrap-cli:ci
+        run: |
+          pnpm bootstrap-cli:ci
+          echo "$HOME/.vite-plus-dev/bin" >> $GITHUB_PATH
 
       - name: Run local CLI `vite install`
         run: |

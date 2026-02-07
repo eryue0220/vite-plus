@@ -45,7 +45,7 @@ pub enum Commands {
     // Category A: Package Manager Commands
     // =========================================================================
     /// Install all dependencies, or add packages if package names are provided
-    #[command(alias = "i")]
+    #[command(visible_alias = "i")]
     Install {
         /// Do not install devDependencies
         #[arg(short = 'P', long)]
@@ -135,6 +135,10 @@ pub enum Commands {
         #[arg(short = 'g', long)]
         global: bool,
 
+        /// Node.js version to use for global installation (only with -g)
+        #[arg(long, requires = "global")]
+        node: Option<String>,
+
         /// Packages to add (if provided, acts as `vp add`)
         #[arg(required = false)]
         packages: Option<Vec<String>>,
@@ -194,6 +198,10 @@ pub enum Commands {
         #[arg(short = 'g', long)]
         global: bool,
 
+        /// Node.js version to use for global installation (only with -g)
+        #[arg(long, requires = "global")]
+        node: Option<String>,
+
         /// Packages to add
         #[arg(required = true)]
         packages: Vec<String>,
@@ -204,7 +212,7 @@ pub enum Commands {
     },
 
     /// Remove packages from dependencies
-    #[command(alias = "rm", alias = "un", alias = "uninstall")]
+    #[command(visible_alias = "rm", visible_alias = "un", visible_alias = "uninstall")]
     Remove {
         /// Only remove from `devDependencies` (pnpm-specific)
         #[arg(short = 'D', long)]
@@ -234,6 +242,10 @@ pub enum Commands {
         #[arg(short = 'g', long)]
         global: bool,
 
+        /// Preview what would be removed without actually removing (only with -g)
+        #[arg(long, requires = "global")]
+        dry_run: bool,
+
         /// Packages to remove
         #[arg(required = true)]
         packages: Vec<String>,
@@ -244,7 +256,7 @@ pub enum Commands {
     },
 
     /// Update packages to their latest versions
-    #[command(alias = "up")]
+    #[command(visible_alias = "up")]
     Update {
         /// Update to latest version (ignore semver range)
         #[arg(short = 'L', long)]
@@ -299,7 +311,7 @@ pub enum Commands {
     },
 
     /// Deduplicate dependencies
-    #[command(alias = "ddp")]
+    #[command(visible_alias = "ddp")]
     Dedupe {
         /// Check if deduplication would make changes
         #[arg(long)]
@@ -365,7 +377,7 @@ pub enum Commands {
     },
 
     /// Show why a package is installed
-    #[command(alias = "explain")]
+    #[command(visible_alias = "explain")]
     Why {
         /// Package(s) to check
         #[arg(required = true)]
@@ -429,7 +441,7 @@ pub enum Commands {
     },
 
     /// View package information from the registry
-    #[command(alias = "view", alias = "show")]
+    #[command(visible_alias = "view", visible_alias = "show")]
     Info {
         /// Package name with optional version
         #[arg(required = true)]
@@ -448,7 +460,7 @@ pub enum Commands {
     },
 
     /// Link packages for local development
-    #[command(alias = "ln")]
+    #[command(visible_alias = "ln")]
     Link {
         /// Package name or directory to link
         #[arg(value_name = "PACKAGE|DIR")]
@@ -573,6 +585,214 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Manage Node.js versions
+    Env(EnvArgs),
+}
+
+/// Arguments for the `env` command
+#[derive(clap::Args, Debug)]
+#[command(after_help = "\
+Examples:
+  vp env setup                  # Create shims for node, npm, npx
+  vp env setup --refresh        # Force refresh shims
+  vp env doctor                 # Check environment configuration
+  vp env default 20.18.0        # Set default Node.js version
+  vp env on                     # Use vite-plus managed Node.js
+  vp env off                    # Prefer system Node.js
+  vp env which node             # Show which node binary will be used
+  vp env pin 20.18.0            # Pin Node.js version in current directory
+  vp env pin lts                # Pin to latest LTS version
+  vp env unpin                  # Remove pinned version
+  vp env list                   # List locally installed Node.js versions
+  vp env list-remote            # List available remote Node.js versions
+  vp env list-remote --lts      # List only LTS versions
+  vp env list-remote 20         # List Node.js 20.x versions
+  vp env install 20.18.0        # Install Node.js 20.18.0
+  vp env install                # Install version from .node-version / package.json
+  vp env install lts            # Install latest LTS version
+  vp env uninstall 20.18.0      # Uninstall Node.js 20.18.0
+  vp env use 20                 # Use Node.js 20 for this shell session
+  vp env use lts                # Use latest LTS for this shell session
+  vp env use                    # Use project version for this shell session
+  vp env use --unset            # Remove session override
+  vp env run --node 20 node -v  # Run 'node -v' with Node.js 20
+  vp env run --node lts npm i   # Run 'npm i' with latest LTS
+  vp env run node -v            # Shim mode (version auto-resolved)
+  vp env run npm install        # Shim mode (version auto-resolved)
+
+Global Packages:
+  vp install -g <package>       # Install a global package
+  vp uninstall -g <package>     # Uninstall a global package
+  vp update -g [package]        # Update global package(s)
+  vp list -g [package]          # List installed global packages")]
+pub struct EnvArgs {
+    /// Show current environment information
+    #[arg(long)]
+    pub current: bool,
+
+    /// Output in JSON format
+    #[arg(long, requires = "current")]
+    pub json: bool,
+
+    /// Print shell snippet to set environment for current session
+    #[arg(long)]
+    pub print: bool,
+
+    /// Subcommand (e.g., 'default', 'setup', 'doctor', 'which')
+    #[command(subcommand)]
+    pub command: Option<EnvSubcommands>,
+}
+
+/// Subcommands for the `env` command
+#[derive(clap::Subcommand, Debug)]
+pub enum EnvSubcommands {
+    /// Set or show the global default Node.js version
+    Default {
+        /// Version to set as default (e.g., "20.18.0", "lts", "latest")
+        /// If not provided, shows the current default
+        version: Option<String>,
+    },
+
+    /// Enable managed mode - shims always use vite-plus managed Node.js
+    On,
+
+    /// Enable system-first mode - shims prefer system Node.js, fallback to managed
+    Off,
+
+    /// Create or update shims in VITE_PLUS_HOME/bin
+    Setup {
+        /// Force refresh shims even if they exist
+        #[arg(long)]
+        refresh: bool,
+        /// Only create env files (skip shims and instructions)
+        #[arg(long)]
+        env_only: bool,
+    },
+
+    /// Run diagnostics and show environment status
+    Doctor,
+
+    /// Show path to the tool that would be executed
+    Which {
+        /// Tool name (node, npm, or npx)
+        tool: String,
+    },
+
+    /// Pin a Node.js version in the current directory (creates .node-version)
+    Pin {
+        /// Version to pin (e.g., "20.18.0", "lts", "latest", "^20.0.0")
+        /// If not provided, shows the current pinned version
+        version: Option<String>,
+
+        /// Remove the .node-version file from current directory
+        #[arg(long)]
+        unpin: bool,
+
+        /// Skip pre-downloading the pinned version
+        #[arg(long)]
+        no_install: bool,
+
+        /// Overwrite existing .node-version without confirmation
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Remove the .node-version file from current directory (alias for `pin --unpin`)
+    Unpin,
+
+    /// List locally installed Node.js versions
+    #[command(visible_alias = "ls")]
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List available Node.js versions from the registry
+    #[command(name = "list-remote", visible_alias = "ls-remote")]
+    ListRemote {
+        /// Filter versions by pattern (e.g., "20" for 20.x versions)
+        pattern: Option<String>,
+
+        /// Show only LTS versions
+        #[arg(long)]
+        lts: bool,
+
+        /// Show all versions (not just recent)
+        #[arg(long)]
+        all: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Version sorting order
+        #[arg(long, value_enum, default_value_t = SortingMethod::Asc)]
+        sort: SortingMethod,
+    },
+
+    /// Run a command with a specific Node.js version
+    Run {
+        /// Node.js version to use (e.g., "20.18.0", "lts", "^20.0.0")
+        /// If not provided and command is node/npm/npx or a global package binary,
+        /// version is resolved automatically (same as shim behavior)
+        #[arg(long)]
+        node: Option<String>,
+
+        /// npm version to use (optional, defaults to bundled)
+        #[arg(long)]
+        npm: Option<String>,
+
+        /// Command and arguments to run
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
+    /// Uninstall a Node.js version
+    #[command(visible_alias = "uni")]
+    Uninstall {
+        /// Version to uninstall (e.g., "20.18.0")
+        #[arg(required = true)]
+        version: String,
+    },
+
+    /// Install a Node.js version
+    #[command(visible_alias = "i")]
+    Install {
+        /// Version to install (e.g., "20", "20.18.0", "lts", "latest")
+        /// If not provided, installs the version from .node-version or package.json
+        version: Option<String>,
+    },
+
+    /// Use a specific Node.js version for this shell session
+    Use {
+        /// Version to use (e.g., "20", "20.18.0", "lts", "latest")
+        /// If not provided, reads from .node-version or package.json
+        version: Option<String>,
+
+        /// Remove session override (revert to file-based resolution)
+        #[arg(long)]
+        unset: bool,
+
+        /// Skip auto-installation if version not present
+        #[arg(long)]
+        no_install: bool,
+
+        /// Suppress output if version is already active
+        #[arg(long)]
+        silent_if_unchanged: bool,
+    },
+}
+
+/// Version sorting order for list-remote command
+#[derive(clap::ValueEnum, Clone, Debug, Default)]
+pub enum SortingMethod {
+    /// Sort versions in ascending order (earliest to latest)
+    #[default]
+    Asc,
+    /// Sort versions in descending order (latest to earliest)
+    Desc,
 }
 
 /// Package manager subcommands
@@ -625,7 +845,7 @@ pub enum PmCommands {
     },
 
     /// List installed packages
-    #[command(alias = "ls")]
+    #[command(visible_alias = "ls")]
     List {
         /// Package pattern to filter
         pattern: Option<String>,
@@ -688,7 +908,7 @@ pub enum PmCommands {
     },
 
     /// View package information from the registry
-    #[command(alias = "info", alias = "show")]
+    #[command(visible_alias = "info", visible_alias = "show")]
     View {
         /// Package name with optional version
         #[arg(required = true)]
@@ -762,7 +982,7 @@ pub enum PmCommands {
     },
 
     /// Manage package owners
-    #[command(subcommand, alias = "author")]
+    #[command(subcommand, visible_alias = "author")]
     Owner(OwnerCommands),
 
     /// Manage package cache
@@ -777,7 +997,7 @@ pub enum PmCommands {
     },
 
     /// Manage package manager configuration
-    #[command(subcommand, alias = "c")]
+    #[command(subcommand, visible_alias = "c")]
     Config(ConfigCommands),
 }
 
@@ -857,7 +1077,7 @@ pub enum ConfigCommands {
 #[derive(Subcommand, Debug, Clone)]
 pub enum OwnerCommands {
     /// List package owners
-    #[command(alias = "ls")]
+    #[command(visible_alias = "ls")]
     List {
         /// Package name
         package: String,
@@ -953,6 +1173,7 @@ pub async fn run_command(cwd: AbsolutePathBuf, args: Args) -> Result<ExitStatus,
             save_optional,
             save_catalog,
             global,
+            node,
             packages,
             pass_through_args,
         } => {
@@ -960,6 +1181,20 @@ pub async fn run_command(cwd: AbsolutePathBuf, args: Args) -> Result<ExitStatus,
             if let Some(pkgs) = packages
                 && !pkgs.is_empty()
             {
+                // Handle global install via vite-plus managed global install
+                if global {
+                    use crate::commands::env::global_install;
+                    for package in &pkgs {
+                        if let Err(e) =
+                            global_install::install(package, node.as_deref(), force).await
+                        {
+                            eprintln!("Failed to install {}: {}", package, e);
+                            return Ok(exit_status(1));
+                        }
+                    }
+                    return Ok(ExitStatus::default());
+                }
+
                 let save_dependency_type =
                     determine_save_dependency_type(dev, save_peer, save_optional, prod);
 
@@ -1016,9 +1251,22 @@ pub async fn run_command(cwd: AbsolutePathBuf, args: Args) -> Result<ExitStatus,
             workspace_root,
             workspace,
             global,
+            node,
             packages,
             pass_through_args,
         } => {
+            // Handle global install via vite-plus managed global install
+            if global {
+                use crate::commands::env::global_install;
+                for package in &packages {
+                    if let Err(e) = global_install::install(package, node.as_deref(), false).await {
+                        eprintln!("Failed to install {}: {}", package, e);
+                        return Ok(exit_status(1));
+                    }
+                }
+                return Ok(ExitStatus::default());
+            }
+
             let save_dependency_type =
                 determine_save_dependency_type(save_dev, save_peer, save_optional, save_prod);
 
@@ -1049,9 +1297,22 @@ pub async fn run_command(cwd: AbsolutePathBuf, args: Args) -> Result<ExitStatus,
             workspace_root,
             recursive,
             global,
+            dry_run,
             packages,
             pass_through_args,
         } => {
+            // Handle global uninstall via vite-plus managed global install
+            if global {
+                use crate::commands::env::global_install;
+                for package in &packages {
+                    if let Err(e) = global_install::uninstall(package, dry_run).await {
+                        eprintln!("Failed to uninstall {}: {}", package, e);
+                        return Ok(exit_status(1));
+                    }
+                }
+                return Ok(ExitStatus::default());
+            }
+
             RemoveCommand::new(cwd)
                 .execute(
                     &packages,
@@ -1082,6 +1343,29 @@ pub async fn run_command(cwd: AbsolutePathBuf, args: Args) -> Result<ExitStatus,
             packages,
             pass_through_args,
         } => {
+            // Handle global update via vite-plus managed global install
+            if global {
+                use crate::commands::env::{global_install, package_metadata::PackageMetadata};
+
+                let packages_to_update = if packages.is_empty() {
+                    let all = PackageMetadata::list_all().await?;
+                    if all.is_empty() {
+                        println!("No global packages installed.");
+                        return Ok(ExitStatus::default());
+                    }
+                    all.iter().map(|p| p.name.clone()).collect::<Vec<_>>()
+                } else {
+                    packages.clone()
+                };
+                for package in &packages_to_update {
+                    if let Err(e) = global_install::install(package, None, false).await {
+                        eprintln!("Failed to update {}: {}", package, e);
+                        return Ok(exit_status(1));
+                    }
+                }
+                return Ok(ExitStatus::default());
+            }
+
             UpdateCommand::new(cwd)
                 .execute(
                     &packages,
@@ -1225,6 +1509,22 @@ pub async fn run_command(cwd: AbsolutePathBuf, args: Args) -> Result<ExitStatus,
         Commands::Preview { args } => commands::delegate::execute(cwd, "preview", &args).await,
 
         Commands::Cache { args } => commands::delegate::execute(cwd, "cache", &args).await,
+
+        Commands::Env(args) => commands::env::execute(cwd, args).await,
+    }
+}
+
+/// Create an exit status with the given code.
+fn exit_status(code: i32) -> ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code << 8)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(code as u32)
     }
 }
 
@@ -1252,20 +1552,22 @@ fn apply_custom_help(cmd: clap::Command) -> clap::Command {
   {bold}cache{reset}      Manage the task cache
   {bold}new{reset}        Generate a new project
   {bold}run{reset}        Run tasks
+  {bold}env{reset}        Manage Node.js versions
 
 {bold_underline}Package Manager Commands:{reset}
-  {bold}install{reset}    Install all dependencies, or add packages if package names are provided
-  {bold}add{reset}        Add packages to dependencies
-  {bold}remove{reset}     Remove packages from dependencies
-  {bold}dedupe{reset}     Deduplicate dependencies by removing older versions
-  {bold}dlx{reset}        Execute a package binary without installing it as a dependency
-  {bold}info{reset}       View package information from the registry
-  {bold}link{reset}       Link packages for local development
-  {bold}outdated{reset}   Check for outdated packages
-  {bold}pm{reset}         Forward a command to the package manager
-  {bold}unlink{reset}     Unlink packages
-  {bold}update{reset}     Update packages to their latest versions
-  {bold}why{reset}        Show why a package is installed
+  {bold}install, i{reset}                     Install all dependencies, or add packages if package names are provided
+  {bold}add{reset}                            Add packages to dependencies
+  {bold}remove, rm, un, uninstall{reset}      Remove packages from dependencies
+  {bold}dedupe, ddp{reset}                    Deduplicate dependencies by removing older versions
+  {bold}dlx{reset}                            Execute a package binary without installing it as a dependency
+  {bold}info, view, show{reset}               View package information from the registry
+  {bold}link, ln{reset}                       Link packages for local development
+  {bold}list, ls{reset}                       List installed packages
+  {bold}outdated{reset}                       Check for outdated packages
+  {bold}pm{reset}                             Forward a command to the package manager
+  {bold}unlink{reset}                         Unlink packages
+  {bold}update, up{reset}                     Update packages to their latest versions
+  {bold}why, explain{reset}                   Show why a package is installed
 "
     );
     let help_template = format!(

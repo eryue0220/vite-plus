@@ -8,6 +8,7 @@ use std::process::ExitStatus;
 use tokio::process::Command;
 use vite_js_runtime::{JsRuntime, JsRuntimeType, download_runtime, download_runtime_for_project};
 use vite_path::{AbsolutePath, AbsolutePathBuf};
+use vite_shared::{PrependOptions, PrependResult, format_path_with_prepend};
 
 use crate::error::Error;
 
@@ -58,7 +59,6 @@ impl JsExecutor {
         // e.g., packages/global/bin/vp -> packages/global/dist/
         let exe_path = std::env::current_exe().map_err(|_| Error::JsScriptsDirNotFound)?;
         // Resolve symlinks to get the real binary path (Unix only)
-        // This is important when vp is symlinked from ~/.local/bin/vp
         // Skip on Windows to avoid path resolution issues
         #[cfg(unix)]
         let exe_path = std::fs::canonicalize(&exe_path).map_err(|_| Error::JsScriptsDirNotFound)?;
@@ -94,17 +94,12 @@ impl JsExecutor {
         }
 
         // Prepend runtime bin to PATH so child processes can find the JS runtime
-        let runtime_bin_path = runtime_bin_prefix.as_path().to_path_buf();
-        let current_path = std::env::var_os("PATH").unwrap_or_default();
-        let paths: Vec<_> = std::env::split_paths(&current_path).collect();
-
-        if !paths.iter().any(|p| p == &runtime_bin_path) {
-            let mut new_paths = vec![runtime_bin_path];
-            new_paths.extend(paths);
-            if let Ok(new_path) = std::env::join_paths(new_paths) {
-                tracing::debug!("Set PATH to {:?}", new_path);
-                cmd.env("PATH", new_path);
-            }
+        let options = PrependOptions { dedupe_anywhere: true };
+        if let PrependResult::Prepended(new_path) =
+            format_path_with_prepend(runtime_bin_prefix.as_path(), options)
+        {
+            tracing::debug!("Set PATH to {:?}", new_path);
+            cmd.env("PATH", new_path);
         }
 
         cmd
@@ -243,6 +238,8 @@ impl JsExecutor {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     #[test]
@@ -290,6 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_execute_cli_script_prints_node_version() {
         use std::io::Write;
 
