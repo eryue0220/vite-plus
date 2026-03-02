@@ -1,18 +1,19 @@
-use std::process::Stdio;
+use std::{collections::BTreeMap, process::Stdio, sync::Arc};
 
+use petgraph::prelude::DiGraphMap;
 use vite_error::Error;
 use vite_path::AbsolutePathBuf;
 use vite_task::ExitStatus;
+use vite_workspace::{PackageNodeIndex, package_graph::IndexedPackageGraph};
 
-use super::{
-    args::ExecFlags,
-    filter::{PackageSelector, filter_packages, parse_package_selector, topological_sort_packages},
-};
+use super::args::ExecArgs;
 
-/// Execute `vp exec` across workspace packages (--recursive or --filter mode).
+/// Execute `vp exec` across workspace packages.
+///
+/// When no filter flags are given, selects the current package (containing `cwd`).
+/// With `--recursive` or `--filter`, selects matching workspace packages.
 pub(super) async fn execute_exec_workspace(
-    flags: &ExecFlags,
-    positional: &[String],
+    args: ExecArgs,
     cwd: &AbsolutePathBuf,
 ) -> Result<ExitStatus, Error> {
     // Find workspace root and load package graph
@@ -21,48 +22,76 @@ pub(super) async fn execute_exec_workspace(
     let graph =
         vite_workspace::load_package_graph(&workspace_root).map_err(|e| Error::Anyhow(e.into()))?;
 
-    // Select packages
-    let selected: Vec<vite_workspace::PackageNodeIndex> = if flags.workspace_root {
-        // -w: workspace root only
-        let indices: Vec<_> =
-            graph.node_indices().filter(|&idx| graph[idx].path.as_str().is_empty()).collect();
-        topological_sort_packages(&graph, &indices)
-    } else if !flags.filters.is_empty() {
-        let selectors: Vec<PackageSelector> =
-            flags.filters.iter().map(|f| parse_package_selector(f)).collect();
-        filter_packages(&graph, &selectors, cwd)
-    } else {
-        // Recursive: non-root packages, optionally including root
-        let indices: Vec<_> = graph
-            .node_indices()
-            .filter(|&idx| flags.include_workspace_root || !graph[idx].path.as_str().is_empty())
-            .collect();
-        topological_sort_packages(&graph, &indices)
+    // Index the graph for O(1) lookups
+    let indexed = IndexedPackageGraph::index(graph);
+
+    // Build the query from exec flags
+    let cwd_arc: Arc<vite_path::AbsolutePath> = cwd.clone().into();
+    let (query, is_cwd_only) = match args.packages.into_package_query(None, &cwd_arc) {
+        Ok(result) => result,
+        Err(e) => {
+            vite_shared::output::error(&vite_str::format!("{e}"));
+            return Ok(ExitStatus(1));
+        }
     };
 
+    // Resolve query into a package subgraph
+    let resolution = match indexed.resolve_query(&query) {
+        Ok(result) => result,
+        Err(e) => {
+            vite_shared::output::error(&vite_str::format!("{e}"));
+            return Ok(ExitStatus(1));
+        }
+    };
+
+    // Warn about unmatched selectors
+    for selector in &resolution.unmatched_selectors {
+        vite_shared::output::warn(&vite_str::format!(
+            "No packages matched the filter '{}'",
+            selector
+        ));
+    }
+
+    let package_graph = indexed.package_graph();
+    let subgraph = resolution.package_subgraph;
+
+    // Topological sort on the subgraph
+    let mut selected = topological_sort_packages(&subgraph);
+
     // Apply --reverse: reverse the execution order
-    let mut selected = selected;
-    if flags.reverse {
+    if args.reverse {
         selected.reverse();
     }
 
     // Apply --resume-from: skip packages until the named one
-    if let Some(ref resume_pkg) = flags.resume_from {
+    if let Some(ref resume_pkg) = args.resume_from {
         if let Some(pos) = selected
             .iter()
-            .position(|&idx| graph[idx].package_json.name.as_str() == resume_pkg.as_str())
+            .position(|&idx| package_graph[idx].package_json.name.as_str() == resume_pkg.as_str())
         {
             selected = selected[pos..].to_vec();
         } else {
-            eprintln!("Package '{}' not found in selected packages", resume_pkg);
+            vite_shared::output::error(&vite_str::format!(
+                "Package '{}' not found in selected packages",
+                resume_pkg
+            ));
             return Ok(ExitStatus(1));
         }
     }
 
     if selected.is_empty() {
-        eprintln!("No packages matched the filter(s)");
+        vite_shared::output::warn("No packages matched the filter(s)");
         return Ok(ExitStatus::SUCCESS);
     }
+
+    let single_package = selected.len() == 1;
+    // Suppress the "pkg_name$ cmd" prefix when only 1 package is selected
+    let show_prefix = !single_package;
+
+    // When no package-selection flags were set (is_cwd_only), execute from the
+    // caller's exact working directory — not the package root.  This matches
+    // `pnpm exec` behaviour.
+    let use_caller_cwd = is_cwd_only;
 
     // Build base PATH: <pm_bin>:<workspace_root/node_modules/.bin>:<original_PATH>
     let base_path_dirs: Vec<std::path::PathBuf> = {
@@ -81,13 +110,12 @@ pub(super) async fn execute_exec_workspace(
     };
     let base_path = std::env::join_paths(&base_path_dirs).unwrap_or_default();
 
-    let cmd_display = positional.join(" ");
+    let cmd_display = args.command.join(" ");
 
     // Track per-package results for --report-summary
-    let mut summary: std::collections::BTreeMap<String, serde_json::Value> =
-        std::collections::BTreeMap::new();
+    let mut summary: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
-    let exit_status = if flags.parallel {
+    let exit_status = if args.parallel && !single_package {
         // Parallel: spawn all processes with independent timing via tokio::spawn
         let mut handles: Vec<(
             String,
@@ -96,33 +124,20 @@ pub(super) async fn execute_exec_workspace(
             >,
         )> = Vec::new();
         for &idx in &selected {
-            let pkg = &graph[idx];
+            let pkg = &package_graph[idx];
             let pkg_name = pkg.package_json.name.to_string();
             let pkg_path = &pkg.absolute_path;
 
-            // Build per-package PATH
-            let bin_dir = pkg_path.join("node_modules").join(".bin");
-            let path_env = if bin_dir.as_path().is_dir() {
-                std::env::join_paths(
-                    std::iter::once(bin_dir.as_path().to_path_buf())
-                        .chain(base_path_dirs.iter().cloned()),
-                )
-                .unwrap_or_default()
-            } else {
-                base_path.clone()
-            };
-
-            let mut cmd = if flags.shell_mode {
-                vite_command::build_shell_command(&cmd_display, pkg_path)
-            } else {
-                let bin_path =
-                    vite_command::resolve_bin(&positional[0], Some(&path_env), pkg_path)?;
-                let mut cmd = vite_command::build_command(&bin_path, pkg_path);
-                if positional.len() > 1 {
-                    cmd.args(&positional[1..]);
-                }
-                cmd
-            };
+            let path_env = build_package_path_env(pkg_path, &base_path_dirs, &base_path);
+            let exec_dir: &vite_path::AbsolutePath =
+                if use_caller_cwd { cwd.as_ref() } else { pkg_path };
+            let mut cmd = build_exec_command(
+                args.shell_mode,
+                &args.command,
+                &cmd_display,
+                &path_env,
+                exec_dir,
+            )?;
             cmd.env("PATH", &path_env)
                 .env("VITE_PLUS_PACKAGE_NAME", &pkg_name)
                 .stdout(Stdio::piped())
@@ -151,7 +166,9 @@ pub(super) async fn execute_exec_workspace(
         // Print outputs in order and track worst exit code
         let mut worst_exit = 0u8;
         for (name, output, duration) in &results {
-            println!("{name}$ {cmd_display}");
+            if show_prefix {
+                vite_shared::output::raw(&vite_str::format!("{name}$ {cmd_display}"));
+            }
             use std::io::Write;
             let _ = std::io::stdout().write_all(&output.stdout);
             let _ = std::io::stderr().write_all(&output.stderr);
@@ -159,7 +176,7 @@ pub(super) async fn execute_exec_workspace(
             if code > worst_exit {
                 worst_exit = code;
             }
-            if flags.report_summary {
+            if args.report_summary {
                 let status = if code == 0 { "passed" } else { "failed" };
                 summary.insert(
                     name.clone(),
@@ -176,36 +193,37 @@ pub(super) async fn execute_exec_workspace(
         // Sequential execution
         let mut final_status = ExitStatus::SUCCESS;
         for &idx in &selected {
-            let pkg = &graph[idx];
+            let pkg = &package_graph[idx];
             let pkg_name = pkg.package_json.name.as_str();
             let pkg_path = &pkg.absolute_path;
 
-            // Build per-package PATH
-            let bin_dir = pkg_path.join("node_modules").join(".bin");
-            let path_env = if bin_dir.as_path().is_dir() {
-                std::env::join_paths(
-                    std::iter::once(bin_dir.as_path().to_path_buf())
-                        .chain(base_path_dirs.iter().cloned()),
-                )
-                .unwrap_or_default()
-            } else {
-                base_path.clone()
-            };
+            let path_env = build_package_path_env(pkg_path, &base_path_dirs, &base_path);
 
-            println!("{pkg_name}$ {cmd_display}");
+            if show_prefix {
+                vite_shared::output::raw(&vite_str::format!("{pkg_name}$ {cmd_display}"));
+            }
 
             let start = std::time::Instant::now();
 
-            let mut cmd = if flags.shell_mode {
-                vite_command::build_shell_command(&cmd_display, pkg_path)
-            } else {
-                let bin_path =
-                    vite_command::resolve_bin(&positional[0], Some(&path_env), pkg_path)?;
-                let mut cmd = vite_command::build_command(&bin_path, pkg_path);
-                if positional.len() > 1 {
-                    cmd.args(&positional[1..]);
+            let exec_dir: &vite_path::AbsolutePath =
+                if use_caller_cwd { cwd.as_ref() } else { pkg_path };
+            let mut cmd = match build_exec_command(
+                args.shell_mode,
+                &args.command,
+                &cmd_display,
+                &path_env,
+                exec_dir,
+            ) {
+                Ok(cmd) => cmd,
+                Err(Error::CannotFindBinaryPath(_)) if single_package => {
+                    vite_shared::output::error(&vite_str::format!(
+                        "Command '{}' not found in node_modules/.bin\n\n\
+                         Hint: Run 'vp install' to install dependencies, or use 'vpx' for remote fallback.",
+                        args.command[0]
+                    ));
+                    return Ok(ExitStatus(1));
                 }
-                cmd
+                Err(e) => return Err(e),
             };
             cmd.env("PATH", &path_env).env("VITE_PLUS_PACKAGE_NAME", pkg_name);
 
@@ -214,7 +232,7 @@ pub(super) async fn execute_exec_workspace(
             let duration = start.elapsed();
             let code = status.code().unwrap_or(1) as u8;
 
-            if flags.report_summary {
+            if args.report_summary {
                 let pkg_status = if code == 0 { "passed" } else { "failed" };
                 summary.insert(
                     pkg_name.to_string(),
@@ -235,15 +253,329 @@ pub(super) async fn execute_exec_workspace(
     };
 
     // Write report summary if requested
-    if flags.report_summary {
+    if args.report_summary {
         let report = serde_json::json!({ "executionStatus": summary });
         let report_path = cwd.join("vp-exec-summary.json");
         if let Err(e) =
             std::fs::write(report_path.as_path(), serde_json::to_string_pretty(&report).unwrap())
         {
-            eprintln!("Failed to write vp-exec-summary.json: {e}");
+            vite_shared::output::error(&vite_str::format!(
+                "Failed to write vp-exec-summary.json: {}",
+                e
+            ));
         }
     }
 
     Ok(exit_status)
+}
+
+/// Build a PATH value for a package, prepending its local node_modules/.bin.
+fn build_package_path_env(
+    pkg_path: &vite_path::AbsolutePath,
+    base_path_dirs: &[std::path::PathBuf],
+    base_path: &std::ffi::OsStr,
+) -> std::ffi::OsString {
+    let bin_dir = pkg_path.join("node_modules").join(".bin");
+    if bin_dir.as_path().is_dir() {
+        std::env::join_paths(
+            std::iter::once(bin_dir.as_path().to_path_buf()).chain(base_path_dirs.iter().cloned()),
+        )
+        .unwrap_or_default()
+    } else {
+        base_path.to_os_string()
+    }
+}
+
+/// Build a [`tokio::process::Command`] for the exec invocation in a package directory.
+fn build_exec_command(
+    shell_mode: bool,
+    command: &[String],
+    cmd_display: &str,
+    path_env: &std::ffi::OsStr,
+    pkg_path: &vite_path::AbsolutePath,
+) -> Result<tokio::process::Command, Error> {
+    if shell_mode {
+        Ok(vite_command::build_shell_command(cmd_display, pkg_path))
+    } else {
+        let bin_path = vite_command::resolve_bin(&command[0], Some(path_env), pkg_path)?;
+        let mut cmd = vite_command::build_command(&bin_path, pkg_path);
+        if command.len() > 1 {
+            cmd.args(&command[1..]);
+        }
+        Ok(cmd)
+    }
+}
+
+/// Sort package indices in topological order (dependencies before dependents).
+///
+/// Uses `petgraph::algo::toposort` for the common acyclic case.
+/// When cycles exist, falls back to `petgraph::algo::tarjan_scc` which
+/// returns SCCs in reverse topological order — preserving correct ordering
+/// for non-cyclic dependencies even when cycles are present.
+fn topological_sort_packages(subgraph: &DiGraphMap<PackageNodeIndex, ()>) -> Vec<PackageNodeIndex> {
+    match petgraph::algo::toposort(subgraph, None) {
+        Ok(mut sorted) => {
+            sorted.reverse();
+            sorted
+        }
+        Err(_cycle) => {
+            // tarjan_scc returns SCCs in reverse topological order of the
+            // condensed DAG.  Edges are dependent → dependency, so reverse
+            // topological = dependencies first — exactly the order we want.
+            // Within a cycle SCC, no valid linear ordering exists; the
+            // intra-SCC order is arbitrary (and correct).
+            petgraph::algo::tarjan_scc(subgraph).into_iter().flatten().collect()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use petgraph::prelude::DiGraphMap;
+    use rustc_hash::FxHashSet;
+    use vite_path::{AbsolutePathBuf, RelativePathBuf};
+    use vite_workspace::{DependencyType, PackageInfo, PackageJson, PackageNodeIndex};
+
+    use super::*;
+
+    /// Build a test dependency graph:
+    /// - app-a depends on lib-c
+    /// - app-b has no workspace dependencies
+    /// - lib-c has no workspace dependencies
+    /// - root (workspace root, empty path)
+    fn build_test_graph()
+    -> petgraph::graph::DiGraph<PackageInfo, DependencyType, vite_workspace::PackageIx> {
+        let mut graph = petgraph::graph::DiGraph::default();
+
+        let root = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "root".into(), ..Default::default() },
+            path: RelativePathBuf::default(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace")).unwrap().into(),
+        });
+        let app_a = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "app-a".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/app-a").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/app-a"))
+                .unwrap()
+                .into(),
+        });
+        let app_b = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "app-b".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/app-b").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/app-b"))
+                .unwrap()
+                .into(),
+        });
+        let lib_c = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "lib-c".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/lib-c").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/lib-c"))
+                .unwrap()
+                .into(),
+        });
+
+        // app-a depends on lib-c
+        graph.add_edge(app_a, lib_c, DependencyType::Normal);
+
+        let _ = (root, app_b); // suppress unused warnings
+        graph
+    }
+
+    /// Build a DiGraphMap subgraph from selected node indices and the original graph edges.
+    fn build_subgraph(
+        graph: &petgraph::graph::DiGraph<PackageInfo, DependencyType, vite_workspace::PackageIx>,
+        selected: &[PackageNodeIndex],
+    ) -> DiGraphMap<PackageNodeIndex, ()> {
+        use petgraph::visit::EdgeRef;
+        let selected_set: FxHashSet<PackageNodeIndex> = selected.iter().copied().collect();
+        let mut subgraph = DiGraphMap::new();
+        for &idx in selected {
+            subgraph.add_node(idx);
+        }
+        for edge in graph.edge_references() {
+            let src = edge.source();
+            let dst = edge.target();
+            if selected_set.contains(&src) && selected_set.contains(&dst) {
+                subgraph.add_edge(src, dst, ());
+            }
+        }
+        subgraph
+    }
+
+    #[test]
+    fn test_topological_sort_simple() {
+        let graph = build_test_graph();
+        // All non-root packages
+        let all: Vec<_> =
+            graph.node_indices().filter(|&idx| !graph[idx].path.as_str().is_empty()).collect();
+        let subgraph = build_subgraph(&graph, &all);
+        let sorted = topological_sort_packages(&subgraph);
+        let names: Vec<&str> =
+            sorted.iter().map(|&idx| graph[idx].package_json.name.as_str()).collect();
+        // lib-c must precede app-a (dependency)
+        let lib_c_pos = names.iter().position(|&n| n == "lib-c").unwrap();
+        let app_a_pos = names.iter().position(|&n| n == "app-a").unwrap();
+        assert!(lib_c_pos < app_a_pos);
+        assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn test_topological_sort_with_cycles() {
+        let mut graph = petgraph::graph::DiGraph::default();
+
+        let root = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "root".into(), ..Default::default() },
+            path: RelativePathBuf::default(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace")).unwrap().into(),
+        });
+        let pkg_a = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "pkg-a".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/pkg-a").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/pkg-a"))
+                .unwrap()
+                .into(),
+        });
+        let pkg_b = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "pkg-b".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/pkg-b").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/pkg-b"))
+                .unwrap()
+                .into(),
+        });
+        let pkg_c = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "pkg-c".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/pkg-c").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/pkg-c"))
+                .unwrap()
+                .into(),
+        });
+
+        // Circular: pkg-a <-> pkg-b
+        graph.add_edge(pkg_a, pkg_b, DependencyType::Normal);
+        graph.add_edge(pkg_b, pkg_a, DependencyType::Normal);
+        // pkg-c has no dependencies
+        let _ = root;
+
+        let selected = vec![pkg_a, pkg_b, pkg_c];
+        let subgraph = build_subgraph(&graph, &selected);
+        let sorted = topological_sort_packages(&subgraph);
+        let names: Vec<&str> =
+            sorted.iter().map(|&idx| graph[idx].package_json.name.as_str()).collect();
+        // All three packages present; pkg-a/pkg-b are cyclic so no ordering
+        // constraint exists between them or relative to independent pkg-c.
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"pkg-a"));
+        assert!(names.contains(&"pkg-b"));
+        assert!(names.contains(&"pkg-c"));
+    }
+
+    #[test]
+    fn test_topological_sort_cycle_with_dependent() {
+        let mut graph = petgraph::graph::DiGraph::default();
+
+        let _root = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "root".into(), ..Default::default() },
+            path: RelativePathBuf::default(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace")).unwrap().into(),
+        });
+        let a = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "a".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/a").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/a"))
+                .unwrap()
+                .into(),
+        });
+        let b = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "b".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/b").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/b"))
+                .unwrap()
+                .into(),
+        });
+        let aa = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "aa".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/aa").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/aa"))
+                .unwrap()
+                .into(),
+        });
+
+        // Cycle: a <-> b
+        graph.add_edge(a, b, DependencyType::Normal);
+        graph.add_edge(b, a, DependencyType::Normal);
+        // aa depends on b (non-cyclic dependent)
+        graph.add_edge(aa, b, DependencyType::Normal);
+
+        let selected = vec![a, b, aa];
+        let subgraph = build_subgraph(&graph, &selected);
+        let sorted = topological_sort_packages(&subgraph);
+        let names: Vec<&str> =
+            sorted.iter().map(|&idx| graph[idx].package_json.name.as_str()).collect();
+        // b must come before aa (aa depends on b). a and b are cyclic so
+        // their relative order is unspecified.
+        let b_pos = names.iter().position(|&n| n == "b").unwrap();
+        let aa_pos = names.iter().position(|&n| n == "aa").unwrap();
+        assert!(b_pos < aa_pos);
+        assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn test_topological_sort_cycle_with_non_cyclic_dependency() {
+        let mut graph = petgraph::graph::DiGraph::default();
+
+        let _root = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "root".into(), ..Default::default() },
+            path: RelativePathBuf::default(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace")).unwrap().into(),
+        });
+        // Add c FIRST so it gets a lower node index than a/b.
+        // This matters because tarjan_scc's intra-SCC order can depend on
+        // graph internals; placing c early verifies that the SCC boundary
+        // (not insertion order) determines the final position.
+        let c = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "c".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/c").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/c"))
+                .unwrap()
+                .into(),
+        });
+        let a = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "a".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/a").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/a"))
+                .unwrap()
+                .into(),
+        });
+        let b = graph.add_node(PackageInfo {
+            package_json: PackageJson { name: "b".into(), ..Default::default() },
+            path: RelativePathBuf::try_from("packages/b").unwrap(),
+            absolute_path: AbsolutePathBuf::new(PathBuf::from("/workspace/packages/b"))
+                .unwrap()
+                .into(),
+        });
+
+        // Cycle: a <-> b
+        graph.add_edge(a, b, DependencyType::Normal);
+        graph.add_edge(b, a, DependencyType::Normal);
+        // a depends on c (non-cyclic dependency)
+        graph.add_edge(a, c, DependencyType::Normal);
+
+        // Insert c first so it gets the earliest position in the subgraph's
+        // internal IndexMap, ensuring the test is not accidentally passing
+        // due to favorable insertion order.
+        let selected = vec![c, a, b];
+        let subgraph = build_subgraph(&graph, &selected);
+        let sorted = topological_sort_packages(&subgraph);
+        let names: Vec<&str> =
+            sorted.iter().map(|&idx| graph[idx].package_json.name.as_str()).collect();
+        // c must come before a (a depends on c). a and b are cyclic so
+        // their relative order is unspecified, but c must precede both
+        // since it is a dependency of a.
+        let c_pos = names.iter().position(|&n| n == "c").unwrap();
+        let a_pos = names.iter().position(|&n| n == "a").unwrap();
+        assert!(c_pos < a_pos, "c ({c_pos}) should precede a ({a_pos}), got: {names:?}");
+        assert_eq!(names.len(), 3);
+    }
 }
