@@ -1,8 +1,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
+use regex::Regex;
 use vite_error::Error;
 
 use crate::{ast_grep, file_walker};
@@ -274,6 +276,231 @@ transform:
 fix: $NEW_IMPORT
 "#;
 
+// Regex patterns for rewriting `/// <reference types="..." />` directives.
+// These cannot be handled by ast-grep because triple-slash references are parsed as comments.
+
+/// `vitest/config` → `vite-plus` (special case, must be applied before generic vitest subpath)
+static RE_REF_VITEST_CONFIG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\s*///\s*<reference\s+types\s*=\s*["'])vitest/config(["']\s*/>)"#).unwrap()
+});
+
+/// bare `vitest` → `vite-plus/test`
+static RE_REF_VITEST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\s*///\s*<reference\s+types\s*=\s*["'])vitest(["']\s*/>)"#).unwrap()
+});
+
+/// `vitest/{subpath}` → `vite-plus/test/{subpath}`
+static RE_REF_VITEST_SUBPATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\s*///\s*<reference\s+types\s*=\s*["'])vitest/(.+?)(["']\s*/>)"#).unwrap()
+});
+
+/// `@vitest/{pkg}[/{subpath}]` → `vite-plus/test/{pkg}[/{subpath}]`
+/// Only matches packages and subpaths that vite-plus actually exports:
+///   - `@vitest/browser` → `vite-plus/test/browser`
+///   - `@vitest/browser/context` → `vite-plus/test/browser/context`
+///   - `@vitest/browser/providers/{name}` → `vite-plus/test/browser/providers/{name}`
+///   - `@vitest/browser-playwright[/{subpath}]` → `vite-plus/test/browser-playwright[/{subpath}]`
+///   - `@vitest/browser-preview[/{subpath}]` → `vite-plus/test/browser-preview[/{subpath}]`
+///   - `@vitest/browser-webdriverio[/{subpath}]` → `vite-plus/test/browser-webdriverio[/{subpath}]`
+static RE_REF_VITEST_SCOPED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\s*///\s*<reference\s+types\s*=\s*["'])@vitest/((?:browser-playwright|browser-preview|browser-webdriverio)(?:/.+?)?|browser(?:/(?:context|providers/.+?))?)(["']\s*/>)"#).unwrap()
+});
+
+/// bare `vite` → `vite-plus`
+static RE_REF_VITE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\s*///\s*<reference\s+types\s*=\s*["'])vite(["']\s*/>)"#).unwrap()
+});
+
+/// `vite/{subpath}` → `vite-plus/{subpath}`
+static RE_REF_VITE_SUBPATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\s*///\s*<reference\s+types\s*=\s*["'])vite/(.+?)(["']\s*/>)"#).unwrap()
+});
+
+/// bare `tsdown` → `vite-plus/pack`
+static RE_REF_TSDOWN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\s*///\s*<reference\s+types\s*=\s*["'])tsdown(["']\s*/>)"#).unwrap()
+});
+
+/// Apply a single regex replacement, updating `content` in place if matched.
+/// Uses `Cow::Owned` variant check to avoid O(n) string comparison on no-match.
+/// Uses `replace` (not `replace_all`) since each line contains at most one reference directive.
+fn apply_regex_replace(content: &mut String, re: &Regex, replacement: &str) -> bool {
+    use std::borrow::Cow;
+    match re.replace(content, replacement) {
+        Cow::Owned(new) => {
+            *content = new;
+            true
+        }
+        Cow::Borrowed(_) => false,
+    }
+}
+
+/// Rewrite `/// <reference types="..." />` directives in place.
+///
+/// Only processes the file preamble (blank lines and comments before the first statement)
+/// to match TypeScript semantics and avoid false positives inside string/template literals.
+/// Allocates only for preamble lines, leaving the file body untouched.
+/// Returns whether any changes were made.
+fn rewrite_reference_types(content: &mut String, skip_packages: &SkipPackages) -> bool {
+    // Fast path: skip files with no triple-slash reference directives.
+    // Check for "///" which covers all spacing variants (///<ref, /// <ref, ///\t<ref).
+    if !content.contains("///") {
+        return false;
+    }
+
+    // Find the byte offset where the preamble ends.
+    // TypeScript allows triple-slash directives after blank lines, single-line comments (//),
+    // block comments (/* ... */), a UTF-8 BOM, and a shebang line.
+    // The preamble ends at the first non-comment statement.
+    let bytes = content.as_bytes();
+    let mut preamble_end = 0;
+    let mut in_block_comment = false;
+
+    // Advance preamble_end past a line and its terminator (\n or \r\n).
+    let advance_past_line = |offset: usize, line_len: usize| -> usize {
+        let mut pos = offset + line_len;
+        if pos < bytes.len() && bytes[pos] == b'\r' {
+            pos += 1;
+        }
+        if pos < bytes.len() && bytes[pos] == b'\n' {
+            pos += 1;
+        }
+        pos
+    };
+
+    // Check what follows after a `*/` close, scanning past any additional `/* ... */` pairs.
+    // Returns `None` if code follows (caller should break).
+    // Returns `Some(true)` if an unclosed `/*` follows (enter block comment).
+    // Returns `Some(false)` if the rest is empty, a `//` comment, or only closed block comments.
+    let check_after_close = |text: &str| -> Option<bool> {
+        let mut remaining = text.trim();
+        loop {
+            if remaining.is_empty() || remaining.starts_with("//") {
+                return Some(false);
+            }
+            if !remaining.starts_with("/*") {
+                return None; // Code follows — end of preamble.
+            }
+            // Another block comment starts — check if it closes on this line.
+            match remaining[2..].find("*/") {
+                Some(pos) => remaining = remaining[2 + pos + 2..].trim(),
+                None => return Some(true), // Unclosed — enter block comment.
+            }
+        }
+    };
+
+    for line in content.lines() {
+        // Strip UTF-8 BOM (U+FEFF) before trimming — Rust's trim() does not remove BOM.
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
+        if in_block_comment {
+            if let Some(pos) = trimmed.find("*/") {
+                match check_after_close(&trimmed[pos + 2..]) {
+                    None => break, // code after */ — end of preamble
+                    Some(new_block) => in_block_comment = new_block,
+                }
+            }
+            preamble_end = advance_past_line(preamble_end, line.len());
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#!") {
+            preamble_end = advance_past_line(preamble_end, line.len());
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            if let Some(pos) = trimmed.find("*/") {
+                match check_after_close(&trimmed[pos + 2..]) {
+                    None => break,
+                    Some(new_block) => in_block_comment = new_block,
+                }
+            } else {
+                in_block_comment = true;
+            }
+            preamble_end = advance_past_line(preamble_end, line.len());
+            continue;
+        }
+        break;
+    }
+
+    // Guard: unclosed block comment means the file has a syntax error; skip rewriting.
+    if in_block_comment {
+        return false;
+    }
+
+    let preamble = &content[..preamble_end];
+    // Check for "///" which covers all spacing variants (///<ref, /// <ref, etc.)
+    if !preamble.contains("///") {
+        return false;
+    }
+
+    // Detect the line ending style used in the preamble for faithful reconstruction.
+    let line_ending = if preamble.contains("\r\n") { "\r\n" } else { "\n" };
+
+    let mut changed = false;
+    let mut preamble_lines: Vec<String> = preamble.lines().map(|l| l.to_string()).collect();
+    // Strip UTF-8 BOM from the first preamble line so the regex `^(\s*///` can match.
+    if let Some(first) = preamble_lines.first_mut() {
+        if first.starts_with('\u{feff}') {
+            *first = first.trim_start_matches('\u{feff}').to_string();
+        }
+    }
+
+    for line in &mut preamble_lines {
+        // The regexes handle flexible spacing (///\s*<reference), so just check for "///"
+        // to avoid filtering out valid variants like ///<reference or ///\t<reference.
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.starts_with("///") {
+            continue;
+        }
+        // Each line matches at most one pattern; use early exit to skip remaining regexes.
+        if !skip_packages.skip_vitest {
+            if apply_regex_replace(line, &RE_REF_VITEST_CONFIG, "${1}vite-plus${2}") {
+                changed = true;
+                continue;
+            }
+            if apply_regex_replace(line, &RE_REF_VITEST_SCOPED, "${1}vite-plus/test/${2}${3}") {
+                changed = true;
+                continue;
+            }
+            if apply_regex_replace(line, &RE_REF_VITEST_SUBPATH, "${1}vite-plus/test/${2}${3}") {
+                changed = true;
+                continue;
+            }
+            if apply_regex_replace(line, &RE_REF_VITEST, "${1}vite-plus/test${2}") {
+                changed = true;
+                continue;
+            }
+        }
+        if !skip_packages.skip_vite {
+            if apply_regex_replace(line, &RE_REF_VITE_SUBPATH, "${1}vite-plus/${2}${3}") {
+                changed = true;
+                continue;
+            }
+            if apply_regex_replace(line, &RE_REF_VITE, "${1}vite-plus${2}") {
+                changed = true;
+                continue;
+            }
+        }
+        if !skip_packages.skip_tsdown
+            && apply_regex_replace(line, &RE_REF_TSDOWN, "${1}vite-plus/pack${2}")
+        {
+            changed = true;
+        }
+    }
+
+    if changed {
+        let suffix = &content[preamble_end..];
+        let mut result = preamble_lines.join(line_ending);
+        // Re-add the line ending between preamble and suffix if the original had one
+        if preamble_end < content.len() || preamble.ends_with('\n') {
+            result.push_str(line_ending);
+        }
+        result.push_str(suffix);
+        *content = result;
+    }
+
+    changed
+}
+
 /// Packages to skip rewriting based on peerDependencies or dependencies
 #[derive(Debug, Clone, Default)]
 struct SkipPackages {
@@ -510,6 +737,10 @@ fn rewrite_import_content(
             updated = true;
         }
     }
+
+    // Apply reference type rewriting (/// <reference types="..." />)
+    // These cannot be handled by ast-grep because they are parsed as comments.
+    updated |= rewrite_reference_types(&mut new_content, skip_packages);
 
     Ok(RewriteResult { content: new_content, updated })
 }
@@ -2065,5 +2296,477 @@ export default defineConfig({});"#
 import { describe } from 'vite-plus/test';
 export default defineConfig({});"#
         );
+    }
+
+    // ====================================
+    // Reference Types Rewriting Tests
+    // ====================================
+
+    #[test]
+    fn test_rewrite_reference_types_vite_client() {
+        let content = r#"/// <reference types="vite/client" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, r#"/// <reference types="vite-plus/client" />"#);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_vite_client_single_quotes() {
+        let content = r#"/// <reference types='vite/client' />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, r#"/// <reference types='vite-plus/client' />"#);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_bare_vite() {
+        let content = r#"/// <reference types="vite" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, r#"/// <reference types="vite-plus" />"#);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_bare_vitest() {
+        let content = r#"/// <reference types="vitest" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, r#"/// <reference types="vite-plus/test" />"#);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_vitest_globals() {
+        let content = r#"/// <reference types="vitest/globals" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, r#"/// <reference types="vite-plus/test/globals" />"#);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_vitest_config() {
+        let content = r#"/// <reference types="vitest/config" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, r#"/// <reference types="vite-plus" />"#);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_vitest_browser() {
+        let content = r#"/// <reference types="vitest/browser" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, r#"/// <reference types="vite-plus/test/browser" />"#);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_vitest_scoped_browser_matchers_not_rewritten() {
+        // @vitest/browser/matchers is NOT exported by vite-plus — should not be rewritten
+        let content = r#"/// <reference types="@vitest/browser/matchers" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(!result.updated);
+        assert_eq!(result.content, content);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_vitest_scoped_browser_context() {
+        let content = r#"/// <reference types="@vitest/browser/context" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, r#"/// <reference types="vite-plus/test/browser/context" />"#);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_vitest_scoped_browser_playwright() {
+        let content = r#"/// <reference types="@vitest/browser/providers/playwright" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            r#"/// <reference types="vite-plus/test/browser/providers/playwright" />"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_vitest_scoped_browser_playwright_pkg() {
+        let content = r#"/// <reference types="@vitest/browser-playwright" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            r#"/// <reference types="vite-plus/test/browser-playwright" />"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_vitest_scoped_browser_webdriverio() {
+        let content = r#"/// <reference types="@vitest/browser/providers/webdriverio" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            r#"/// <reference types="vite-plus/test/browser/providers/webdriverio" />"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_tsdown_subpath_not_rewritten() {
+        // tsdown subpaths should NOT be rewritten because vite-plus only exports ./pack (no subpaths)
+        let content = r#"/// <reference types="tsdown/client" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(!result.updated);
+        assert_eq!(result.content, content);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_vitest_scoped_not_matching() {
+        // Non-enumerated @vitest/* packages should NOT be rewritten
+        let content = r#"/// <reference types="@vitest/coverage-v8" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(!result.updated);
+        assert_eq!(result.content, content);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_inside_template_literal_not_rewritten() {
+        // Reference-like content inside template literals should NOT be rewritten.
+        // The preamble ends at the first non-comment line (`const`), so nothing is processed.
+        let content = r#"const template = `
+/// <reference types="vite/client" />
+`;"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(!result.updated);
+        assert_eq!(result.content, content);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_preamble_only() {
+        // Only references in the preamble (before first statement) should be rewritten
+        let content = r#"/// <reference types="vite/client" />
+// A regular comment
+
+const x = 1;
+/// <reference types="vitest" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        // First reference (preamble) is rewritten; last one (after code) is not
+        assert_eq!(
+            result.content,
+            r#"/// <reference types="vite-plus/client" />
+// A regular comment
+
+const x = 1;
+/// <reference types="vitest" />"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_after_block_comment() {
+        // Block comments (/* ... */) should not end the preamble scan
+        let content = "/* License: MIT */\n/// <reference types=\"vite/client\" />\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            "/* License: MIT */\n/// <reference types=\"vite-plus/client\" />\n"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_after_multiline_block_comment() {
+        // Multi-line block comments should be skipped entirely
+        let content =
+            "/*\n * License header\n * Copyright 2024\n */\n/// <reference types=\"vitest\" />\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            "/*\n * License header\n * Copyright 2024\n */\n/// <reference types=\"vite-plus/test\" />\n"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_block_comment_with_trailing_code() {
+        // A single-line block comment followed by code should end the preamble
+        let content = "/* banner */ const x = 1;\n/// <reference types=\"vite/client\" />\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(!result.updated);
+        assert_eq!(result.content, content);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_block_comment_with_trailing_comment() {
+        // A block comment followed by a line comment is still preamble
+        let content = "/* banner */ // generated\n/// <reference types=\"vite/client\" />\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            "/* banner */ // generated\n/// <reference types=\"vite-plus/client\" />\n"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_multiline_block_comment_closes_into_code() {
+        // Multi-line block comment closing line has code after */ — end of preamble
+        let content = "/*\n * License\n */ const x = 1;\n/// <reference types=\"vite/client\" />\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(!result.updated);
+        assert_eq!(result.content, content);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_multiline_block_comment_closes_into_comment() {
+        // Multi-line block comment closing line has only a comment after */ — still preamble
+        let content = "/*\n * License\n */ // end\n/// <reference types=\"vite/client\" />\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            "/*\n * License\n */ // end\n/// <reference types=\"vite-plus/client\" />\n"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_block_close_into_new_block_comment() {
+        // `/* a */ /* b` closes first comment then opens a new multi-line one
+        let content = "/* a */ /* b\n * still going */\n/// <reference types=\"vite/client\" />\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            "/* a */ /* b\n * still going */\n/// <reference types=\"vite-plus/client\" />\n"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_multiple_inline_block_comments_then_code() {
+        // `/* a */ /* b */ const x = 1;` — code after two closed block comments ends preamble
+        let content = "/* a */ /* b */ const x = 1;\n/// <reference types=\"vite/client\" />\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(!result.updated);
+        assert_eq!(result.content, content);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_multiple_inline_block_comments_no_code() {
+        // `/* a */ /* b */` — only block comments, no trailing code, preamble continues
+        let content = "/* a */ /* b */\n/// <reference types=\"vite/client\" />\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            "/* a */ /* b */\n/// <reference types=\"vite-plus/client\" />\n"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_vitest_browser_providers_playwright() {
+        // @vitest/browser/providers/playwright → vite-plus/test/browser/providers/playwright
+        let content = r#"/// <reference types="@vitest/browser/providers/playwright" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            r#"/// <reference types="vite-plus/test/browser/providers/playwright" />"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_crlf() {
+        // CRLF line endings should be preserved
+        let content =
+            "/// <reference types=\"vite/client\" />\r\n/// <reference types=\"vitest\" />\r\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            "/// <reference types=\"vite-plus/client\" />\r\n/// <reference types=\"vite-plus/test\" />\r\n"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_crlf_with_block_comment() {
+        // CRLF + block comment header
+        let content =
+            "/* License */\r\n/// <reference types=\"vite/client\" />\r\nconst x = 1;\r\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            "/* License */\r\n/// <reference types=\"vite-plus/client\" />\r\nconst x = 1;\r\n"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_no_space_after_slashes() {
+        // TypeScript accepts ///<reference without a space
+        let content = r#"///<reference types="vite/client" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, r#"///<reference types="vite-plus/client" />"#);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_tab_after_slashes() {
+        // TypeScript accepts ///\t<reference with a tab
+        let content = "///\t<reference types=\"vite/client\" />";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, "///\t<reference types=\"vite-plus/client\" />");
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_after_shebang() {
+        // Shebang lines should not end the preamble scan
+        let content = "#!/usr/bin/env node\n/// <reference types=\"vite/client\" />\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            "#!/usr/bin/env node\n/// <reference types=\"vite-plus/client\" />\n"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_after_bom() {
+        // UTF-8 BOM should not end the preamble scan; BOM is stripped during rewrite
+        let content = "\u{feff}/// <reference types=\"vite/client\" />\n";
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, "/// <reference types=\"vite-plus/client\" />\n");
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_bare_tsdown() {
+        let content = r#"/// <reference types="tsdown" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, r#"/// <reference types="vite-plus/pack" />"#);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_already_migrated() {
+        let content = r#"/// <reference types="vite-plus/client" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(!result.updated);
+        assert_eq!(result.content, content);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_preserves_non_matching() {
+        let content = r#"/// <reference types="node" />
+/// <reference lib="es2015" />
+/// <reference path="./types.d.ts" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(!result.updated);
+        assert_eq!(result.content, content);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_with_leading_whitespace() {
+        let content = r#"  /// <reference types="vite/client" />"#;
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(result.content, r#"  /// <reference types="vite-plus/client" />"#);
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_env_d_ts_style() {
+        let content = r#"/// <reference types="vite/client" />
+/// <reference types="vitest" />
+/// <reference types="vitest/globals" />
+/// <reference types="vitest/config" />
+/// <reference types="@vitest/browser/context" />"#;
+
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            r#"/// <reference types="vite-plus/client" />
+/// <reference types="vite-plus/test" />
+/// <reference types="vite-plus/test/globals" />
+/// <reference types="vite-plus" />
+/// <reference types="vite-plus/test/browser/context" />"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_mixed_with_imports() {
+        let content = r#"/// <reference types="vite/client" />
+import { defineConfig } from 'vite';
+
+export default defineConfig({});"#;
+
+        let result = rewrite_import_content(content, &SkipPackages::default()).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            r#"/// <reference types="vite-plus/client" />
+import { defineConfig } from 'vite-plus';
+
+export default defineConfig({});"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_skip_vite() {
+        let content = r#"/// <reference types="vite/client" />
+/// <reference types="vitest" />"#;
+
+        let skip_packages =
+            SkipPackages { skip_vite: true, skip_vitest: false, skip_tsdown: false };
+        let result = rewrite_import_content(content, &skip_packages).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            r#"/// <reference types="vite/client" />
+/// <reference types="vite-plus/test" />"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_skip_vitest() {
+        let content = r#"/// <reference types="vite/client" />
+/// <reference types="vitest" />
+/// <reference types="@vitest/browser/matchers" />"#;
+
+        let skip_packages =
+            SkipPackages { skip_vite: false, skip_vitest: true, skip_tsdown: false };
+        let result = rewrite_import_content(content, &skip_packages).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            r#"/// <reference types="vite-plus/client" />
+/// <reference types="vitest" />
+/// <reference types="@vitest/browser/matchers" />"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_skip_tsdown() {
+        let content = r#"/// <reference types="tsdown/client" />
+/// <reference types="vite/client" />"#;
+
+        let skip_packages =
+            SkipPackages { skip_vite: false, skip_vitest: false, skip_tsdown: true };
+        let result = rewrite_import_content(content, &skip_packages).unwrap();
+        assert!(result.updated);
+        assert_eq!(
+            result.content,
+            r#"/// <reference types="tsdown/client" />
+/// <reference types="vite-plus/client" />"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_types_skip_all() {
+        let content = r#"/// <reference types="vite/client" />
+/// <reference types="vitest" />
+/// <reference types="tsdown/client" />"#;
+
+        let skip_packages = SkipPackages { skip_vite: true, skip_vitest: true, skip_tsdown: true };
+        let result = rewrite_import_content(content, &skip_packages).unwrap();
+        assert!(!result.updated);
+        assert_eq!(result.content, content);
     }
 }
