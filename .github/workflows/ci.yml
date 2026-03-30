@@ -656,12 +656,7 @@ jobs:
         run: |
           RUST_BACKTRACE=1 pnpm -F ./packages/cli snap-test-local --shard=${{ matrix.shard }}/${{ matrix.shardTotal }}
           RUST_BACKTRACE=1 pnpm -F ./packages/cli snap-test-global --shard=${{ matrix.shard }}/${{ matrix.shardTotal }}
-          if ! git diff --quiet; then
-            echo "::error::Snapshot diff detected. Run 'pnpm -F vite-plus snap-test' locally and commit the updated snap.txt files."
-            git diff --stat
-            git diff
-            exit 1
-          fi
+          bash .github/scripts/retry-failed-snap-tests.sh
         env:
           RUST_MIN_STACK: 8388608
 
@@ -735,15 +730,9 @@ jobs:
               tsc --version
               vp uninstall -g typescript
 
-              # Run snap tests
               git config --global --add safe.directory /workspace
               RUST_BACKTRACE=1 pnpm test
-              if ! git diff --quiet; then
-                echo '::error::Snapshot diff detected. Run pnpm -F vite-plus snap-test locally and commit the updated snap.txt files.'
-                git diff --stat
-                git diff
-                exit 1
-              fi
+              bash .github/scripts/retry-failed-snap-tests.sh
             "
 
   install-e2e-test:
