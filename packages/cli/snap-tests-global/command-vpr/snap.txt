@@ -32,24 +32,18 @@ Documentation: https://viteplus.dev/guide/run
 
 
 > vpr hello # should run script via vpr shorthand
-
-> command-vpr@<semver> hello <cwd>
-> node args.mjs hello from script
-
+$ node args.mjs hello from script ⊘ cache disabled
 hello
 from
 script
 
+
 > vpr greet --arg1 value1 # should pass through additional args
-
-> command-vpr@<semver> greet <cwd>
-> node args.mjs greet --arg1 value1
-
+$ node args.mjs greet --arg1 value1 ⊘ cache disabled
 greet
 --arg1
 value1
 
-[1]> vpr nonexistent # should show pnpm missing script error
- ERR_PNPM_NO_SCRIPT  Missing script: nonexistent
 
-Command "nonexistent" not found.
+[1]> vpr nonexistent # should show pnpm missing script error
+Task "nonexistent" not found.
