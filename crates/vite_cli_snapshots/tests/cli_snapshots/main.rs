@@ -444,6 +444,17 @@ impl CaseInstall {
             return Ok(self.vpt.clone());
         }
 
+        // An explicit `./`-prefixed program runs a file the case itself
+        // produced inside the staged workspace (a packed executable); the
+        // prefix keeps bare names on the PATH rule below.
+        if program.starts_with("./") {
+            let candidate = cwd.join(program);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+            return Err(format!("`{program}` does not exist relative to the step cwd"));
+        }
+
         let found = which::which_in(program, Some(case_path), cwd)
             .map_err(|e| format!("`{program}` not found on the case PATH: {e}"))?;
         // Git is a fixture dependency in real create/migrate flows, so steps may
@@ -641,10 +652,15 @@ impl CaseHome {
     /// the npm prefix is a sibling of `home`, which the `<home>` pair never
     /// matches, and it leaked raw temp paths into snapshots until it was
     /// paired here.
-    fn redaction_paths(&self) -> [(String, &'static str); 2] {
+    fn redaction_paths(&self) -> [(String, &'static str); 3] {
+        let root = self.home.parent().unwrap();
         [
             (self.home.to_str().unwrap().to_owned(), "<home>"),
             (self.npm_prefix().to_str().unwrap().to_owned(), "<npm-prefix>"),
+            // Last, so the specific dirs above win: fixtures may create
+            // siblings of the workspace (`vpt mkdir -p ../test-lib`), whose
+            // paths tools then echo back (a yarn portal resolution).
+            (root.to_str().unwrap().to_owned(), "<case>"),
         ]
     }
 }
@@ -892,6 +908,8 @@ fn start_local_registry(
     let mut cmd = std::process::Command::new(node);
     cmd.arg(&script)
         .arg("--serve")
+        // The server discovers the fixture's own packages relative to the
+        // staged workspace, so it must run from there.
         .current_dir(stage)
         .env_clear()
         .envs(case_env)
@@ -1029,7 +1047,12 @@ fn run_case(
     let _registry = if case.local_registry {
         let pack_dir = local_registry_pack
             .ok_or("internal error: local-registry case reached run_case without a packed dir")?;
-        let registry_node = case_install.resolve_program("node", &case_path, &stage)?;
+        // Prefer the seed runtime's real node binary over the case's node
+        // shim: the shim resolves the project's pinned runtime from its cwd,
+        // and a fixture pinning an older Node (a `.node-version` under test)
+        // must not pick the runtime executing this TypeScript helper.
+        let registry_node = flavor::seed_runtime_node()
+            .map_or_else(|| case_install.resolve_program("node", &case_path, &stage), Ok)?;
         let (registry_env, handle) =
             start_local_registry(&registry_node, &stage, pack_dir, &case_env)?;
         for (key, value) in registry_env {
